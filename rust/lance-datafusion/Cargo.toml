@@ -23,6 +23,7 @@ datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-substrait = { workspace = true, optional = true }
 futures.workspace = true
+geodatafusion = { version = "0.1.0-dev" }
 lance-arrow.workspace = true
 lance-core = { workspace = true, features = ["datafusion"] }
 lance-datagen.workspace = true

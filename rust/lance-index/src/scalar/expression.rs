@@ -88,6 +88,19 @@ pub trait ScalarQueryParser: std::fmt::Debug + Send + Sync {
         func: &ScalarUDF,
         args: &[Expr],
     ) -> Option<IndexedExpression>;
+    
+    /// Visit a spatial query (for geo indices)
+    fn visit_spatial_query(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        spatial_query: &crate::geo::SpatialQuery,
+    ) -> Option<IndexedExpression> {
+        // Default implementation returns None - only geo indices should implement this
+        println!("🌍 DEFAULT visit_spatial_query called for column {}: {:?} (this parser: {:?})", column, spatial_query, self);
+        let _ = (column, data_type, spatial_query);
+        None
+    }
 }
 
 /// A generic parser that wraps multiple scalar query parsers
@@ -158,6 +171,27 @@ impl ScalarQueryParser for MultiQueryParser {
         self.parsers
             .iter()
             .find_map(|parser| parser.visit_scalar_function(column, data_type, func, args))
+    }
+    
+    fn visit_spatial_query(
+        &self,
+        column: &str,
+        data_type: &DataType,
+        spatial_query: &crate::geo::SpatialQuery,
+    ) -> Option<IndexedExpression> {
+        println!("🌍 MultiQueryParser::visit_spatial_query delegating to {} parsers", self.parsers.len());
+        self.parsers
+            .iter()
+            .find_map(|parser| {
+                println!("🌍 Trying parser: {:?}", parser);
+                let result = parser.visit_spatial_query(column, data_type, spatial_query);
+                if result.is_some() {
+                    println!("🌍 MultiQueryParser found result from parser!");
+                } else {
+                    println!("🌍 Parser returned None");
+                }
+                result
+            })
     }
 }
 
@@ -480,6 +514,337 @@ impl ScalarQueryParser for FtsQueryParser {
         } else {
             None
         }
+    }
+}
+
+/// A query parser for geo indices (spatial queries)
+#[derive(Debug)]
+pub struct GeoQueryParser {
+    pub index_name: String,
+}
+
+impl GeoQueryParser {
+    pub fn new(index_name: String) -> Self {
+        println!("🌍 GeoQueryParser::new created for index: {}", index_name);
+        Self { index_name }
+    }
+
+    /// Extract a bounding box from a spatial function expression
+    fn extract_bounding_box_from_expr(expr: &Expr) -> Option<crate::geo::BoundingBox> {
+        use crate::geo::BoundingBox;
+        
+        println!("🌍     extract_bounding_box_from_expr: {:?}", expr);
+        
+        // Try to extract from literals like BBOX(min_x, min_y, max_x, max_y)
+        // or from struct literals
+        match expr {
+            Expr::ScalarFunction(func) if func.func.name() == "bbox" => {
+                println!("🌍     Found BBOX function with {} args", func.args.len());
+                if func.args.len() == 4 {
+                    let min_x = Self::extract_numeric_literal(&func.args[0])?;
+                    let min_y = Self::extract_numeric_literal(&func.args[1])?;
+                    let max_x = Self::extract_numeric_literal(&func.args[2])?;
+                    let max_y = Self::extract_numeric_literal(&func.args[3])?;
+                    let bbox = BoundingBox::new(min_x, min_y, max_x, max_y);
+                    println!("🌍     ✅ Extracted bounding box: {:?}", bbox);
+                    return Some(bbox);
+                } else {
+                    println!("🌍     ❌ BBOX function expects 4 args, got {}", func.args.len());
+                }
+            }
+            // Handle encoded BBOX strings like "BBOX(-125.0,30.0,-115.0,45.0)"
+            Expr::Literal(scalar_value, _) => {
+                println!("🌍     Found literal value: {:?}", scalar_value);
+                if let ScalarValue::Utf8(Some(bbox_str)) = scalar_value {
+                    if bbox_str.starts_with("BBOX(") && bbox_str.ends_with(")") {
+                        if let Some(bbox) = Self::parse_encoded_bbox(bbox_str) {
+                            println!("🌍     ✅ Extracted bounding box from encoded string: {:?}", bbox);
+                            return Some(bbox);
+                        } else {
+                            println!("🌍     ❌ Failed to parse encoded BBOX string: {}", bbox_str);
+                        }
+                    } else {
+                        println!("🌍     ❌ Literal string is not an encoded BBOX: {}", bbox_str);
+                    }
+                } else {
+                    println!("🌍     ❌ Literal is not a string: {:?}", scalar_value);
+                }
+            }
+            // Handle other bounding box representations as needed
+            _ => {
+                println!("🌍     ❌ Expression is not a BBOX function or encoded BBOX string: {:?}", expr);
+            }
+        }
+        None
+    }
+
+    /// Extract a point from a spatial function expression
+    fn extract_point_from_expr(expr: &Expr) -> Option<crate::geo::Point> {
+        use crate::geo::Point;
+        
+        println!("🌍     extract_point_from_expr: {:?}", expr);
+        
+        // Try to extract from literals like POINT(x, y)
+        match expr {
+            Expr::ScalarFunction(func) if func.func.name() == "POINT" => {
+                println!("🌍     Found POINT function with {} args", func.args.len());
+                if func.args.len() == 2 {
+                    let x = Self::extract_numeric_literal(&func.args[0])?;
+                    let y = Self::extract_numeric_literal(&func.args[1])?;
+                    let point = Point::new(x, y);
+                    println!("🌍     ✅ Extracted point: {:?}", point);
+                    return Some(point);
+                } else {
+                    println!("🌍     ❌ POINT function expects 2 args, got {}", func.args.len());
+                }
+            }
+            // Handle other point representations as needed
+            _ => {
+                println!("🌍     ❌ Expression is not a POINT function: {:?}", expr);
+            }
+        }
+        None
+    }
+
+    /// Extract a distance value from an expression
+    fn extract_distance_from_expr(expr: &Expr) -> Option<f64> {
+        Self::extract_numeric_literal(expr)
+    }
+
+    /// Extract numeric value from literal expressions  
+    fn extract_numeric_literal(expr: &Expr) -> Option<f64> {
+        // Use debug format to extract numeric value safely
+        let expr_str = format!("{:?}", expr);
+        
+        // Look for patterns like: Literal(Float64(-122.5), None) or Literal(Int64(37), None)
+        if expr_str.contains("Float64(") {
+            if let Some(start) = expr_str.find("Float64(") {
+                let start = start + "Float64(".len();
+                if let Some(end) = expr_str[start..].find(")") {
+                    let value_str = &expr_str[start..start + end];
+                    if let Ok(val) = value_str.parse::<f64>() {
+                        return Some(val);
+                    }
+                }
+            }
+        } else if expr_str.contains("Int64(") {
+            if let Some(start) = expr_str.find("Int64(") {
+                let start = start + "Int64(".len();
+                if let Some(end) = expr_str[start..].find(")") {
+                    let value_str = &expr_str[start..start + end];
+                    if let Ok(val) = value_str.parse::<i64>() {
+                        return Some(val as f64);
+                    }
+                }
+            }
+        } else if expr_str.contains("Float32(") {
+            if let Some(start) = expr_str.find("Float32(") {
+                let start = start + "Float32(".len();
+                if let Some(end) = expr_str[start..].find(")") {
+                    let value_str = &expr_str[start..start + end];
+                    if let Ok(val) = value_str.parse::<f32>() {
+                        return Some(val as f64);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Parse an encoded BBOX string like "BBOX(-125.0,30.0,-115.0,45.0)"
+    fn parse_encoded_bbox(bbox_str: &str) -> Option<crate::geo::BoundingBox> {
+        use crate::geo::BoundingBox;
+        
+        // Remove "BBOX(" prefix and ")" suffix
+        let coords_str = &bbox_str[5..bbox_str.len()-1];
+        println!("🌍       Parsing encoded BBOX coordinates: {}", coords_str);
+        
+        // Split by commas to get the 4 values
+        let coords: Vec<&str> = coords_str.split(',').collect();
+        
+        if coords.len() != 4 {
+            println!("🌍       ❌ Expected 4 coordinates, got {}", coords.len());
+            return None;
+        }
+        
+        // Parse the 4 numeric values
+        let mut values = Vec::with_capacity(4);
+        for coord in coords {
+            match coord.trim().parse::<f64>() {
+                Ok(val) => values.push(val),
+                Err(e) => {
+                    println!("🌍       ❌ Failed to parse coordinate '{}': {}", coord, e);
+                    return None;
+                }
+            }
+        }
+        
+        let bbox = BoundingBox::new(values[0], values[1], values[2], values[3]);
+        println!("🌍       ✅ Parsed encoded BBOX: {:?}", bbox);
+        Some(bbox)
+    }
+}
+
+impl ScalarQueryParser for GeoQueryParser {
+    fn visit_between(
+        &self,
+        _: &str,
+        _: &Bound<ScalarValue>,
+        _: &Bound<ScalarValue>,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_in_list(&self, _: &str, _: &[ScalarValue]) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_bool(&self, _: &str, _: bool) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_is_null(&self, _: &str) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_comparison(
+        &self,
+        _: &str,
+        _: &ScalarValue,
+        _: &Operator,
+    ) -> Option<IndexedExpression> {
+        None
+    }
+
+    fn visit_scalar_function(
+        &self,
+        column: &str,
+        _data_type: &DataType,
+        func: &ScalarUDF,
+        args: &[Expr],
+    ) -> Option<IndexedExpression> {
+        use crate::geo::SpatialQuery;
+        
+        println!("🌍 GeoQueryParser::visit_scalar_function: func = {}, args.len() = {}", func.name(), args.len());
+        println!("🌍   Index: {}, Column: {}", self.index_name, column);
+        println!("🌍   Column: {}, Index: {}", column, self.index_name);
+        println!("🌍   Data type: {:?}", _data_type);
+        
+        for (i, arg) in args.iter().enumerate() {
+            println!("🌍   Arg[{}]: {:?}", i, arg);
+        }
+        
+        match func.name() {
+            "st_intersects" => {
+                // ST_Intersects(geometry_column, bounding_box_literal)
+                println!("🌍   Processing ST_Intersects");
+                if args.len() == 2 {
+                    println!("🌍   Extracting bounding box from arg[1]");
+                    if let Some(bbox) = Self::extract_bounding_box_from_expr(&args[1]) {
+                        let spatial_query = SpatialQuery::Intersects(bbox);
+                        println!("🌍   ✅ Created ST_Intersects query: {:?}", spatial_query);
+                        return Some(IndexedExpression::index_query(
+                            column.to_string(),
+                            self.index_name.clone(),
+                            Arc::new(spatial_query),
+                        ));
+                    } else {
+                        println!("🌍   ❌ Failed to extract bounding box from arg[1]");
+                    }
+                } else {
+                    println!("🌍   ❌ ST_Intersects expects 2 args, got {}", args.len());
+                }
+            }
+            "st_within" => {
+                // ST_Within(geometry_column, bounding_box_literal)
+                println!("🌍   Processing st_within");
+                if args.len() == 2 {
+                    println!("🌍   Extracting bounding box from arg[1]");
+                    if let Some(bbox) = Self::extract_bounding_box_from_expr(&args[1]) {
+                        let spatial_query = SpatialQuery::Within(bbox);
+                        println!("🌍   ✅ Created ST_Within query: {:?}", spatial_query);
+                        return Some(IndexedExpression::index_query(
+                            column.to_string(),
+                            self.index_name.clone(),
+                            Arc::new(spatial_query),
+                        ));
+                    } else {
+                        println!("🌍   ❌ Failed to extract bounding box from arg[1]");
+                    }
+                } else {
+                    println!("🌍   ❌ ST_Within expects 2 args, got {}", args.len());
+                }
+            }
+            "ST_Contains" => {
+                // ST_Contains(geometry_column, point_literal)
+                println!("🌍   Processing ST_Contains");
+                if args.len() == 2 {
+                    println!("🌍   Extracting point from arg[1]");
+                    if let Some(point) = Self::extract_point_from_expr(&args[1]) {
+                        let spatial_query = SpatialQuery::Contains(point);
+                        println!("🌍   ✅ Created ST_Contains query: {:?}", spatial_query);
+                        return Some(IndexedExpression::index_query(
+                            column.to_string(),
+                            self.index_name.clone(),
+                            Arc::new(spatial_query),
+                        ));
+                    } else {
+                        println!("🌍   ❌ Failed to extract point from arg[1]");
+                    }
+                } else {
+                    println!("🌍   ❌ ST_Contains expects 2 args, got {}", args.len());
+                }
+            }
+            "ST_DWithin" => {
+                // ST_DWithin(geometry_column, point_literal, distance_literal)
+                println!("🌍   Processing ST_DWithin");
+                if args.len() == 3 {
+                    println!("🌍   Extracting point from arg[1]");
+                    if let Some(point) = Self::extract_point_from_expr(&args[1]) {
+                        println!("🌍   ✅ Extracted point: {:?}", point);
+                        println!("🌍   Extracting distance from arg[2]");
+                        if let Some(distance) = Self::extract_distance_from_expr(&args[2]) {
+                            let spatial_query = SpatialQuery::DWithin(point, distance);
+                            println!("🌍   ✅ Created ST_DWithin query: {:?}", spatial_query);
+                            return Some(IndexedExpression::index_query(
+                                column.to_string(),
+                                self.index_name.clone(),
+                                Arc::new(spatial_query),
+                            ));
+                        } else {
+                            println!("🌍   ❌ Failed to extract distance from arg[2]");
+                        }
+                    } else {
+                        println!("🌍   ❌ Failed to extract point from arg[1]");
+                    }
+                } else {
+                    println!("🌍   ❌ ST_DWithin expects 3 args, got {}", args.len());
+                }
+            }
+            _ => {
+                println!("🌍   ❌ Unsupported spatial function: {}", func.name());
+            }
+        }
+        
+        println!("🌍   ❌ No spatial query created - returning None");
+        None
+    }
+
+    fn visit_spatial_query(
+        &self,
+        column: &str,
+        _data_type: &DataType,
+        spatial_query: &crate::geo::SpatialQuery,
+    ) -> Option<IndexedExpression> {
+        println!("🌍 GeoQueryParser::visit_spatial_query called for column {}: {:?}", column, spatial_query);
+        println!("🌍 GeoQueryParser index_name: {}", self.index_name);
+        let result = Some(IndexedExpression::index_query(
+            column.to_string(),
+            self.index_name.clone(),
+            Arc::new(spatial_query.clone()),
+        ));
+        println!("🌍 GeoQueryParser returning: {:?}", result.is_some());
+        result
     }
 }
 
@@ -1146,6 +1511,10 @@ fn maybe_range(
 
     parser.visit_between(left_col, &low, &high)
 }
+
+
+
+
 
 fn visit_and(
     expr: &BinaryExpr,

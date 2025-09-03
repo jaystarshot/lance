@@ -22,6 +22,7 @@ use snafu::location;
 use std::convert::TryFrom;
 
 pub mod frag_reuse;
+pub mod geo;
 pub mod mem_wal;
 pub mod metrics;
 pub mod optimize;
@@ -96,6 +97,8 @@ pub enum IndexType {
 
     MemWal = 7,
 
+    Geo = 8, // Spatial index using R-tree
+
     // 100+ and up for vector index.
     /// Flat vector index.
     Vector = 100, // Legacy vector index, alias to IvfPq
@@ -117,6 +120,7 @@ impl std::fmt::Display for IndexType {
             Self::NGram => write!(f, "NGram"),
             Self::FragmentReuse => write!(f, "FragmentReuse"),
             Self::MemWal => write!(f, "MemWal"),
+            Self::Geo => write!(f, "Geo"),
             Self::Vector | Self::IvfPq => write!(f, "IVF_PQ"),
             Self::IvfFlat => write!(f, "IVF_FLAT"),
             Self::IvfSq => write!(f, "IVF_SQ"),
@@ -140,6 +144,7 @@ impl TryFrom<i32> for IndexType {
             v if v == Self::Inverted as i32 => Ok(Self::Inverted),
             v if v == Self::FragmentReuse as i32 => Ok(Self::FragmentReuse),
             v if v == Self::MemWal as i32 => Ok(Self::MemWal),
+            v if v == Self::Geo as i32 => Ok(Self::Geo),
             v if v == Self::Vector as i32 => Ok(Self::Vector),
             v if v == Self::IvfFlat as i32 => Ok(Self::IvfFlat),
             v if v == Self::IvfSq as i32 => Ok(Self::IvfSq),
@@ -165,6 +170,7 @@ impl IndexType {
                 | Self::LabelList
                 | Self::Inverted
                 | Self::NGram
+                | Self::Geo
         )
     }
 
@@ -200,6 +206,7 @@ impl IndexType {
             Self::NGram => 0,
             Self::FragmentReuse => 0,
             Self::MemWal => 0,
+            Self::Geo => 0,
 
             // for now all vector indices are built by the same builder,
             // so they share the same version.

@@ -49,6 +49,7 @@ pub enum ScalarIndexType {
     LabelList,
     NGram,
     Inverted,
+    Geo,
 }
 
 impl TryFrom<IndexType> for ScalarIndexType {
@@ -61,6 +62,7 @@ impl TryFrom<IndexType> for ScalarIndexType {
             IndexType::LabelList => Ok(Self::LabelList),
             IndexType::NGram => Ok(Self::NGram),
             IndexType::Inverted => Ok(Self::Inverted),
+            IndexType::Geo => Ok(Self::Geo),
             _ => Err(Error::InvalidInput {
                 source: format!("Index type {:?} is not a scalar index", value).into(),
                 location: location!(),
@@ -77,6 +79,7 @@ impl From<ScalarIndexType> for IndexType {
             ScalarIndexType::LabelList => Self::LabelList,
             ScalarIndexType::NGram => Self::NGram,
             ScalarIndexType::Inverted => Self::Inverted,
+            ScalarIndexType::Geo => Self::Geo,
         }
     }
 }
@@ -107,6 +110,7 @@ impl IndexParams for ScalarIndexParams {
             Some(ScalarIndexType::LabelList) => IndexType::LabelList,
             Some(ScalarIndexType::Inverted) => IndexType::Inverted,
             Some(ScalarIndexType::NGram) => IndexType::NGram,
+            Some(ScalarIndexType::Geo) => IndexType::Geo,
         }
     }
 

@@ -2017,11 +2017,11 @@ class LanceDataset(pa.dataset.Dataset):
             raise KeyError(f"{column} not found in schema")
 
         index_type = index_type.upper()
-        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED"]:
+        if index_type not in ["BTREE", "BITMAP", "NGRAM", "LABEL_LIST", "INVERTED", "GEO"]:
             raise NotImplementedError(
                 (
                     'Only "BTREE", "LABEL_LIST", "INVERTED", "NGRAM", '
-                    'or "BITMAP" are supported for '
+                    '"BITMAP", or "GEO" are supported for '
                     f"scalar columns.  Received {index_type}",
                 )
             )
@@ -2063,6 +2063,23 @@ class LanceDataset(pa.dataset.Dataset):
                 raise TypeError(
                     f"INVERTED index column {column} must be string, large string"
                     " or list of strings, but got {value_type}"
+                )
+        elif index_type == "GEO":
+            # Accept struct<x: double, y: double> for GeoArrow point data
+            if pa.types.is_struct(field_type):
+                field_names = [field.name for field in field_type]
+                if set(field_names) == {"x", "y"}:
+                    # This is geoarrow point data - allow it
+                    pass
+                else:
+                    raise TypeError(
+                        f"GEO index column {column} must be a struct with x,y fields for point data. "
+                        f"Got struct with fields: {field_names}"
+                    )
+            else:
+                raise TypeError(
+                    f"GEO index column {column} must be a struct<x: double, y: double> type. "
+                    f"Got field type: {field_type}"
                 )
 
         if pa.types.is_duration(field_type):

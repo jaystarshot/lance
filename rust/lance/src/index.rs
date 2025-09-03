@@ -27,7 +27,7 @@ use lance_index::frag_reuse::{FragReuseIndex, FRAG_REUSE_INDEX_NAME};
 use lance_index::mem_wal::{MemWalIndex, MEM_WAL_INDEX_NAME};
 use lance_index::pb::index::Implementation;
 use lance_index::scalar::expression::{
-    FtsQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
+    FtsQueryParser, GeoQueryParser, IndexInformationProvider, LabelListQueryParser, MultiQueryParser,
     SargableQueryParser, ScalarQueryParser, TextQueryParser,
 };
 use lance_index::scalar::lance_format::LanceIndexStore;
@@ -1357,6 +1357,17 @@ impl DatasetIndexInternalExt for Dataset {
             let query_parser = match field.data_type() {
                 DataType::List(_) => Box::new(LabelListQueryParser::new(index.name.clone()))
                     as Box<dyn ScalarQueryParser>,
+                DataType::Struct(_) => {
+                    // Check if this is a geo index
+                    let index_type = detect_scalar_index_type(self, index, &field.name).await?;
+                    if matches!(index_type, ScalarIndexType::Geo) {
+                        Box::new(GeoQueryParser::new(index.name.clone()))
+                            as Box<dyn ScalarQueryParser>
+                    } else {
+                        Box::new(SargableQueryParser::new(index.name.clone()))
+                            as Box<dyn ScalarQueryParser>
+                    }
+                }
                 DataType::Utf8 | DataType::LargeUtf8 => {
                     let index_type = detect_scalar_index_type(self, index, &field.name).await?;
                     match index_type {

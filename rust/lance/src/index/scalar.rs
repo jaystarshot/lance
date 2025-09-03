@@ -27,6 +27,11 @@ use lance_index::scalar::{
     inverted::METADATA_FILE,
     ngram::{train_ngram_index, NGramIndex},
 };
+use lance_index::geo::{
+    builder::train_geo_index,
+    rtree::RTreeIndex,
+    GeoIndex, GeoIndexParams,
+};
 use lance_index::ScalarIndexCriteria;
 use lance_index::{
     scalar::{
@@ -215,6 +220,42 @@ pub(super) fn inverted_index_details() -> prost_types::Any {
     prost_types::Any::from_msg(&details).unwrap()
 }
 
+fn geo_index_details() -> prost_types::Any {
+    let details = lance_table::format::pb::GeoIndexDetails {};
+    prost_types::Any::from_msg(&details).unwrap()
+}
+
+/// Check if a field is suitable for geo indexing by examining field structure
+/// This function accepts both GeoArrow extensions and struct<x: double, y: double> format for point data
+fn is_suitable_for_geo_index(field: &Field) -> bool {
+    println!("🌍 is_suitable_for_geo_index: field.name = {}", field.name);
+    println!("🌍 is_suitable_for_geo_index: field.logical_type = {:?}", field.logical_type);
+    println!("🌍 is_suitable_for_geo_index: field.metadata = {:?}", field.metadata);
+    
+    // Check for GeoArrow extension metadata first
+    if let Some(extension_name) = field.metadata.get("ARROW:extension:name") {
+        println!("🌍 is_suitable_for_geo_index: found extension: {}", extension_name);
+        
+        // Support GeoArrow Point type
+        if extension_name == "geoarrow.point" {
+            println!("🌍 is_suitable_for_geo_index: GeoArrow Point detected!");
+            return true;
+        }
+        
+        // Support other GeoArrow types
+        if extension_name.starts_with("geoarrow.") {
+            println!("🌍 is_suitable_for_geo_index: GeoArrow extension detected: {}", extension_name);
+            return true;
+        }
+    }
+    
+
+     
+     println!("🌍 is_suitable_for_geo_index: field metadata: {:?}", field.metadata);
+     println!("🌍 is_suitable_for_geo_index: not a recognized geo format");
+     false
+}
+
 impl ScalarIndexDetails for lance_table::format::pb::BitmapIndexDetails {
     fn get_type(&self) -> ScalarIndexType {
         ScalarIndexType::Bitmap
@@ -245,6 +286,12 @@ impl ScalarIndexDetails for lance_table::format::pb::NGramIndexDetails {
     }
 }
 
+impl ScalarIndexDetails for lance_table::format::pb::GeoIndexDetails {
+    fn get_type(&self) -> ScalarIndexType {
+        ScalarIndexType::Geo
+    }
+}
+
 fn get_scalar_index_details(
     details: &prost_types::Any,
 ) -> Result<Option<Box<dyn ScalarIndexDetails>>> {
@@ -267,6 +314,10 @@ fn get_scalar_index_details(
     } else if details.type_url.ends_with("NGramIndexDetails") {
         Ok(Some(Box::new(
             details.to_msg::<lance_table::format::pb::NGramIndexDetails>()?,
+        )))
+    } else if details.type_url.ends_with("GeoIndexDetails") {
+        Ok(Some(Box::new(
+            details.to_msg::<lance_table::format::pb::GeoIndexDetails>()?,
         )))
     } else {
         Ok(None)
@@ -324,7 +375,8 @@ pub(super) async fn build_scalar_index(
 
     // In theory it should be possible to create a btree/bitmap index on a nested field but
     // performance would be poor and I'm not sure we want to allow that unless there is a need.
-    if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList))
+    // Exception: LabelList and Geo indexes are allowed on nested fields.
+    if !matches!(params.force_index_type, Some(ScalarIndexType::LabelList | ScalarIndexType::Geo))
         && field.data_type().is_nested()
     {
         return Err(Error::InvalidInput {
@@ -360,6 +412,22 @@ pub(super) async fn build_scalar_index(
             }
             train_ngram_index(training_request, &index_store).await?;
             Ok(ngram_index_details())
+        }
+        Some(ScalarIndexType::Geo) => {
+            // Validate that this is a suitable column for geo indexing
+            if !is_suitable_for_geo_index(&field) {
+                return Err(Error::InvalidInput {
+                    source: format!(
+                        "Geo index can only be created on struct columns with x,y fields for point data. Column '{}' does not have struct<x: double, y: double> format.",
+                        column
+                    ).into(),
+                    location: location!(),
+                });
+            }
+            let geo_params = GeoIndexParams::default();
+            let batches_source = training_request.scan_unordered_chunks(4096).await?;
+            train_geo_index(batches_source, Arc::new(index_store), &geo_params).await?;
+            Ok(geo_index_details())
         }
         _ => {
             let flat_index_trainer = FlatIndexMetadata::new(field.data_type());
@@ -431,6 +499,10 @@ pub async fn open_scalar_index(
             let btree_index = BTreeIndex::load(index_store, frag_reuse_index, index_cache).await?;
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
+        ScalarIndexType::Geo => {
+            let geo_index = <RTreeIndex as GeoIndex>::load(index_store).await?;
+            Ok(geo_index)
+        }
     }
 }
 
@@ -439,6 +511,7 @@ async fn infer_scalar_index_type(
     index_uuid: &str,
     column: &str,
 ) -> Result<ScalarIndexType> {
+    println!("🌍 INFERRING: index type for column '{}', uuid: {}", column, index_uuid);
     let index_dir = dataset.indices_dir().child(index_uuid.to_string());
     let col = dataset.schema().field(column).ok_or(Error::Internal {
         message: format!(
@@ -447,6 +520,7 @@ async fn infer_scalar_index_type(
         ),
         location: location!(),
     })?;
+    println!("🌍 INFERRING: column '{}' has data type: {:?}", column, col.data_type());
 
     let bitmap_page_lookup = index_dir.child(BITMAP_LOOKUP_NAME);
     let inverted_list_lookup = index_dir.child(METADATA_FILE);
@@ -462,10 +536,15 @@ async fn infer_scalar_index_type(
             .await?
     {
         ScalarIndexType::Inverted
+    } else if matches!(col.data_type(), DataType::Struct(_)) && is_suitable_for_geo_index(&col) {
+        println!("🌍 INFERRED: Detected geo index for column {}", column);
+        ScalarIndexType::Geo
     } else {
+        println!("🌍 INFERRED: Falling back to BTree for column {}", column);
         ScalarIndexType::BTree
     };
 
+    println!("🌍 INFERRED: Final index type for column '{}': {:?}", column, index_type);
     Ok(index_type)
 }
 

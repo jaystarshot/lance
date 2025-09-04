@@ -500,6 +500,8 @@ pub async fn open_scalar_index(
             Ok(btree_index as Arc<dyn ScalarIndex>)
         }
         ScalarIndexType::Geo => {
+            // Load paged leaf R-tree (now the default geo index implementation)
+            println!("🌲 Loading paged leaf R-tree geo index");
             let geo_index = <RTreeIndex as GeoIndex>::load(index_store).await?;
             Ok(geo_index)
         }

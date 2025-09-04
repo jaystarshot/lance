@@ -17,6 +17,7 @@ use lance_core::{Result};
 
 pub mod builder;
 pub mod rtree;
+pub mod paged_leaf_rtree;
 
 pub const LANCE_GEO_INDEX: &str = "__lance_geo_index";
 
@@ -103,6 +104,30 @@ impl BoundingBox {
 
     pub fn to_aabb(&self) -> AABB<[f64; 2]> {
         AABB::from_corners([self.min_x, self.min_y], [self.max_x, self.max_y])
+    }
+
+    /// Check if this bounding box intersects with another bounding box
+    pub fn intersects(&self, other: &BoundingBox) -> bool {
+        !(self.max_x < other.min_x || 
+          self.min_x > other.max_x || 
+          self.max_y < other.min_y || 
+          self.min_y > other.max_y)
+    }
+
+    /// Check if this bounding box is entirely within another bounding box
+    pub fn within(&self, other: &BoundingBox) -> bool {
+        self.min_x >= other.min_x &&
+        self.max_x <= other.max_x &&
+        self.min_y >= other.min_y &&
+        self.max_y <= other.max_y
+    }
+
+    /// Check if this bounding box contains a point
+    pub fn contains_point(&self, point: &Point) -> bool {
+        point.x >= self.min_x &&
+        point.x <= self.max_x &&
+        point.y >= self.min_y &&
+        point.y <= self.max_y
     }
 }
 

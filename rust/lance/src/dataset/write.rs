@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::num::NonZero;
 use std::sync::Arc;
+use url::Url;
 
 use arrow_array::RecordBatch;
 use chrono::TimeDelta;
@@ -225,6 +226,18 @@ pub struct WriteParams {
     /// This can include commit messages, engine information, etc.
     /// this properties map will be persisted as part of Transaction object.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
+
+    /// Additional bucket URIs for registering in the manifest during dataset creation.
+    /// When provided in CREATE mode, these bucket URIs will be registered in the manifest
+    /// as available buckets, but actual writing location is determined by target_bucket_uri.
+    /// Only used in CREATE mode for manifest registration.
+    pub data_bucket_uris: Option<Vec<String>>,
+
+    /// Target bucket URI for writing data files.
+    /// When provided, all new data files will be written to this specific bucket URI.
+    /// Used in all modes (CREATE, APPEND, OVERWRITE) to specify where data should be written.
+    /// If not provided, data will be written to the primary bucket.
+    pub target_bucket_uri: Option<String>,
 }
 
 impl Default for WriteParams {
@@ -246,6 +259,8 @@ impl Default for WriteParams {
             auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
             transaction_properties: None,
+            data_bucket_uris: None,
+            target_bucket_uri: None,
         }
     }
 }
@@ -308,6 +323,18 @@ pub async fn do_write_fragments(
     params: WriteParams,
     storage_version: LanceFileVersion,
 ) -> Result<Vec<Fragment>> {
+    do_write_fragments_with_manifest(object_store, base_dir, schema, data, params, storage_version, None).await
+}
+
+pub async fn do_write_fragments_with_manifest(
+    object_store: Arc<ObjectStore>,
+    base_dir: &Path,
+    schema: &Schema,
+    data: SendableRecordBatchStream,
+    params: WriteParams,
+    storage_version: LanceFileVersion,
+    existing_manifest: Option<&lance_table::format::Manifest>,
+) -> Result<Vec<Fragment>> {
     // Convert arrow.json to lance.json (JSONB) for storage if needed
     //
     // FIXME: this is bad, really bad, we need to find a way to remove this.
@@ -324,7 +351,146 @@ pub async fn do_write_fragments(
             .boxed()
     };
 
-    let writer_generator = WriterGenerator::new(object_store, base_dir, schema, storage_version);
+    // Validate multi-bucket configuration
+    match params.mode {
+        WriteMode::Create => {
+            // CREATE mode: both data_bucket_uris and target_bucket_uri must be provided together for multi-bucket mode
+            match (params.data_bucket_uris.is_some(), params.target_bucket_uri.is_some()) {
+                (true, false) => {
+                    return Err(Error::invalid_input(
+                        "In CREATE mode, when data_bucket_uris is provided, target_bucket_uri must also be specified to indicate where data should be written",
+                        location!(),
+                    ));
+                },
+                (false, true) => {
+                    return Err(Error::invalid_input(
+                        "In CREATE mode, when target_bucket_uri is provided, data_bucket_uris must also be specified to register the buckets in the manifest",
+                        location!(),
+                    ));
+                },
+                (true, true) => {
+                    // Valid: both provided for multi-bucket mode
+                },
+                (false, false) => {
+                    // Valid: neither provided for single-bucket mode
+                }
+            }
+        },
+        WriteMode::Append | WriteMode::Overwrite => {
+            // APPEND/OVERWRITE modes: should not register new buckets
+            if params.data_bucket_uris.is_some() {
+                return Err(Error::invalid_input(
+                    format!(
+                        "data_bucket_uris should not be provided in {:?} mode. Bucket registry already exists in the dataset manifest. Only specify target_bucket_uri to indicate where to write new data.",
+                        params.mode
+                    ),
+                    location!(),
+                ));
+            }
+            // target_bucket_uri without data_bucket_uris is valid - we'll look up bucket ID from existing manifest
+        }
+    }
+
+    // Handle target bucket configuration - if specified, update the base directory for writing
+    let (final_object_store, final_base_dir, target_bucket_id) = if let Some(target_bucket_uri) = &params.target_bucket_uri {
+        println!("🪣 {:?} mode: Target bucket specified -> {}", params.mode, target_bucket_uri);
+        // Parse the target bucket URI and update the base directory
+        let target_path = if let Ok(url) = Url::parse(target_bucket_uri) {
+            Path::parse(url.path().trim_start_matches('/'))?
+        } else {
+            Path::parse(target_bucket_uri)?
+        };
+        println!("🪣 Writing to target bucket path: {}", target_path);
+        
+        // Find the bucket ID for this target URI
+        let bucket_id = match params.mode {
+            WriteMode::Create => {
+                // CREATE mode: use data_bucket_uris to determine bucket ID (both are guaranteed to exist by validation above)
+                if let Some(data_bucket_uris) = &params.data_bucket_uris {
+                    println!("🔍 CREATE mode: Looking for target_bucket_uri '{}' in data_bucket_uris: {:?}", target_bucket_uri, data_bucket_uris);
+                    let position = data_bucket_uris.iter().position(|uri| {
+                        let matches = uri == target_bucket_uri;
+                        println!("🔍 Comparing '{}' == '{}': {}", uri, target_bucket_uri, matches);
+                        matches
+                    });
+                    println!("🔍 Found position: {:?}", position);
+                    let bucket_id = position.map(|pos| (pos + 1) as u32).ok_or_else(|| {
+                        Error::invalid_input(
+                            format!(
+                                "target_bucket_uri '{}' not found in data_bucket_uris {:?}. The target bucket must be one of the registered buckets.",
+                                target_bucket_uri, data_bucket_uris
+                            ),
+                            location!(),
+                        )
+                    })?;
+                    println!("🔍 Assigned bucket_id: {}", bucket_id);
+                    bucket_id
+                } else {
+                    // This should never happen due to validation above, but just in case
+                    return Err(Error::invalid_input(
+                        "Internal error: target_bucket_uri provided but data_bucket_uris is None in CREATE mode",
+                        location!(),
+                    ));
+                }
+            },
+            WriteMode::Append | WriteMode::Overwrite => {
+                // APPEND/OVERWRITE modes: look up bucket ID from existing manifest
+                if let Some(manifest) = existing_manifest {
+                    println!("🔍 {:?} mode: Looking up bucket_id for target_bucket_uri '{}' from existing manifest", params.mode, target_bucket_uri);
+                    
+                    // Look through the manifest's base_paths to find which bucket ID matches this URI
+                    let target_path_with_data = format!("{}/data", target_bucket_uri);
+                    let mut found_bucket_id = None;
+                    
+                    for (bucket_id, base_path) in &manifest.base_paths {
+                        println!("🔍 Checking bucket {}: path='{}' vs target='{}'", bucket_id, base_path.path, target_path_with_data);
+                        if base_path.path == target_path_with_data {
+                            found_bucket_id = Some(*bucket_id);
+                            break;
+                        }
+                    }
+                    
+                    match found_bucket_id {
+                        Some(bucket_id) => {
+                            println!("🔍 Found bucket_id {} for target_bucket_uri '{}'", bucket_id, target_bucket_uri);
+                            bucket_id
+                        },
+                        None => {
+                            return Err(Error::invalid_input(
+                                format!(
+                                    "target_bucket_uri '{}' not found in existing dataset's bucket registry. Available buckets: {:?}",
+                                    target_bucket_uri,
+                                    manifest.base_paths.iter().map(|(id, bp)| format!("{}:{}", id, bp.path)).collect::<Vec<_>>()
+                                ),
+                                location!(),
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(Error::invalid_input(
+                        format!(
+                            "Cannot use target_bucket_uri '{}' in {:?} mode without existing dataset manifest",
+                            target_bucket_uri, params.mode
+                        ),
+                        location!(),
+                    ));
+                }
+            }
+        };
+        
+        (object_store, target_path, Some(bucket_id))
+    } else {
+        println!("🪣 {:?} mode: Using primary bucket (no target_bucket_uri specified)", params.mode);
+        (object_store, base_dir.clone(), None)
+    };
+    
+    let writer_generator = WriterGenerator::new(final_object_store, &final_base_dir, schema, storage_version, target_bucket_id);
+    
+    // For CREATE mode, data_bucket_uris will be registered in the manifest (handled in transaction.rs)
+    if matches!(params.mode, WriteMode::Create) && params.data_bucket_uris.is_some() {
+        println!("🪣 CREATE mode: {} additional buckets will be registered in manifest", 
+                 params.data_bucket_uris.as_ref().unwrap().len());
+    }
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
     let mut fragments = Vec::new();
@@ -494,13 +660,15 @@ pub async fn write_fragments_internal(
     }
 
     let frag_schema = schema.retain_storage_class(StorageClass::Default);
-    let fragments_fut = do_write_fragments(
+    let existing_manifest = dataset.map(|ds| ds.manifest.as_ref());
+    let fragments_fut = do_write_fragments_with_manifest(
         object_store.clone(),
         base_dir,
         &frag_schema,
         data,
         params,
         storage_version,
+        existing_manifest,
     );
 
     let (default, blob) = if let Some(blob_data) = blob_data {
@@ -643,12 +811,17 @@ pub async fn open_writer(
     Ok(writer)
 }
 
+
 /// Creates new file writers for a given dataset.
 struct WriterGenerator {
     object_store: Arc<ObjectStore>,
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
+    /// Fragment counter for bucket selection
+    fragment_counter: std::sync::atomic::AtomicU32,
+    /// Target bucket ID (if writing to a specific bucket)
+    target_bucket_id: Option<u32>,
 }
 
 impl WriterGenerator {
@@ -657,28 +830,80 @@ impl WriterGenerator {
         base_dir: &Path,
         schema: &Schema,
         storage_version: LanceFileVersion,
+        target_bucket_id: Option<u32>,
     ) -> Self {
         Self {
             object_store,
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
+            fragment_counter: std::sync::atomic::AtomicU32::new(0),
+            target_bucket_id,
         }
     }
 
+
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
-        // Use temporary ID 0; will assign ID later.
+        // Get the next fragment ID for bucket selection
+        let fragment_id = self.fragment_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        
+        // Use temporary ID 0; will assign actual ID later.
         let fragment = Fragment::new(0);
 
-        let writer = open_writer(
-            &self.object_store,
+        // Simple single bucket mode - write to the configured base directory
+        if let Some(bucket_id) = self.target_bucket_id {
+            println!("📝 Fragment {} writing to target bucket {} at directory: {}", fragment_id, bucket_id, self.base_dir);
+        } else {
+            println!("📝 Fragment {} writing to primary bucket at directory: {}", fragment_id, self.base_dir);
+        }
+
+        let mut writer = open_writer(
+            self.object_store.as_ref(),
             &self.schema,
             &self.base_dir,
             self.storage_version,
         )
         .await?;
 
+        // If writing to a target bucket, wrap the writer to set base_id on DataFiles
+        if let Some(bucket_id) = self.target_bucket_id {
+            writer = Box::new(BucketAwareWriter {
+                inner: writer,
+                bucket_id,
+            });
+            println!("📝 Wrapped writer with BucketAwareWriter for bucket {}", bucket_id);
+        }
+
+        println!("✅ Writer created for fragment {}", fragment_id);
         Ok((writer, fragment))
+    }
+}
+
+/// Wrapper writer that sets the bucket_id on DataFile creation
+struct BucketAwareWriter {
+    inner: Box<dyn GenericWriter>,
+    bucket_id: u32,
+}
+
+#[async_trait::async_trait]
+impl GenericWriter for BucketAwareWriter {
+    async fn write(&mut self, batches: &[RecordBatch]) -> Result<()> {
+        self.inner.write(batches).await
+    }
+
+    async fn tell(&mut self) -> Result<u64> {
+        self.inner.tell().await
+    }
+
+    async fn finish(&mut self) -> Result<(u32, DataFile)> {
+        println!("🏁 Finishing BucketAwareWriter for bucket {}", self.bucket_id);
+        let (num_rows, mut data_file) = self.inner.finish().await?;
+        println!("🏁 DataFile before base_id set: path={}, base_id={:?}", data_file.path, data_file.base_id);
+        // Set the bucket_id on the DataFile
+        data_file.base_id = Some(self.bucket_id);
+        println!("🏁 DataFile after base_id set: path={}, base_id={:?} ({} rows)", 
+                 data_file.path, data_file.base_id, num_rows);
+        Ok((num_rows, data_file))
     }
 }
 

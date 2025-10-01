@@ -2507,6 +2507,21 @@ pub fn get_write_params(options: &Bound<'_, PyDict>) -> PyResult<Option<WritePar
 
         p.commit_handler = get_commit_handler(options)?;
 
+        // Handle data bucket URIs
+        if let Some(data_bucket_uris) = get_dict_opt::<Vec<String>>(options, "data_bucket_uris")? {
+            println!("🐍 Python -> Rust: data_bucket_uris = {:?}", data_bucket_uris);
+            p.data_bucket_uris = Some(data_bucket_uris);
+        } else {
+            println!("🐍 Python -> Rust: no data_bucket_uris provided");
+        }
+
+        if let Some(target_bucket_uri) = get_dict_opt::<String>(options, "target_bucket_uri")? {
+            println!("🐍 Python -> Rust: target_bucket_uri = {:?}", target_bucket_uri);
+            p.target_bucket_uri = Some(target_bucket_uri);
+        } else {
+            println!("🐍 Python -> Rust: no target_bucket_uri provided");
+        }
+
         // Handle properties
         if let Some(props) =
             get_dict_opt::<HashMap<String, String>>(options, "transaction_properties")?

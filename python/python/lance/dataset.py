@@ -4696,6 +4696,8 @@ def write_dataset(
     auto_cleanup_options: Optional[AutoCleanupConfig] = None,
     commit_message: Optional[str] = None,
     transaction_properties: Optional[Dict[str, str]] = None,
+    data_bucket_uris: Optional[List[str]] = None,
+    target_bucket_uri: Optional[str] = None,
 ) -> LanceDataset:
     """Write a given data_obj to the given uri
 
@@ -4774,6 +4776,19 @@ def write_dataset(
         and can be retrieved using read_transaction().
         If both `commit_message` and `properties` are provided, `commit_message` will
         override any "lance.commit.message" key in `properties`.
+    data_bucket_uris: list of str, optional
+        *Experimental*. Additional bucket URIs for registering in the manifest
+        during dataset creation. When provided in CREATE mode, these bucket URIs
+        will be registered in the manifest as available buckets for future use.
+        Only used in CREATE mode for manifest registration.
+        Example: ["s3://bucket2/data", "s3://bucket3/data"]
+    target_bucket_uri: str, optional
+        *Experimental*. Target bucket URI for writing data files.
+        When provided, all new data files will be written to this specific
+        bucket URI. Used in all modes (CREATE, APPEND, OVERWRITE) to specify
+        where data should be written. If not provided, data will be written
+        to the primary bucket.
+        Example: "s3://target-bucket/data"
     """
     if use_legacy_format is not None:
         warnings.warn(
@@ -4815,6 +4830,8 @@ def write_dataset(
         "enable_stable_row_ids": enable_stable_row_ids,
         "auto_cleanup_options": auto_cleanup_options,
         "transaction_properties": merged_properties,
+        "data_bucket_uris": data_bucket_uris,
+        "target_bucket_uri": target_bucket_uri,
     }
 
     if commit_lock:

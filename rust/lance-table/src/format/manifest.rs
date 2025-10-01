@@ -944,3 +944,4 @@ mod tests {
         assert_eq!(manifest.config, config);
     }
 }
+

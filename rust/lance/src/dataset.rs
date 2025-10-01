@@ -154,6 +154,9 @@ pub struct Dataset {
 
     /// File reader options to use when reading data files.
     pub(crate) file_reader_options: Option<FileReaderOptions>,
+    
+    /// Store parameters used to create this dataset's object store (for multi-bucket support)
+    pub(crate) store_params: Option<lance_io::object_store::ObjectStoreParams>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -437,6 +440,7 @@ impl Dataset {
             self.session.clone(),
             self.commit_handler.clone(),
             self.file_reader_options.clone(),
+            self.store_params.clone(),
         )
     }
 
@@ -552,6 +556,7 @@ impl Dataset {
         session: Arc<Session>,
         commit_handler: Arc<dyn CommitHandler>,
         file_reader_options: Option<FileReaderOptions>,
+        store_params: Option<lance_io::object_store::ObjectStoreParams>,
     ) -> Result<Self> {
         let tags = Tags::new(
             object_store.clone(),
@@ -574,6 +579,7 @@ impl Dataset {
             metadata_cache,
             index_cache,
             file_reader_options,
+            store_params,
         })
     }
 
@@ -699,6 +705,7 @@ impl Dataset {
                 self.session.clone(),
                 self.commit_handler.clone(),
                 self.file_reader_options.clone(),
+                self.store_params.clone(),
             )?;
             Ok(Some(Arc::new(blobs_dataset)))
         } else {
@@ -1240,6 +1247,9 @@ impl Dataset {
                     )
                 })?;
 
+                println!("🔍 Multi-bucket: bucket_uri: '{:?}', path: '{}'", base_path.name, base_path.path);
+                
+                // For multi-bucket, the path is already relative to the bucket
                 let path = Path::parse(base_path.path.as_str())?;
                 if base_path.is_dataset_root {
                     Ok(path.child(DATA_DIR))
@@ -1248,6 +1258,60 @@ impl Dataset {
                 }
             }
             None => Ok(self.base.child(DATA_DIR)),
+        }
+    }
+
+    /// Get the ObjectStore for a specific bucket based on base_id
+    pub(crate) async fn get_object_store_for_bucket(&self, base_id: Option<&u32>) -> Result<Arc<lance_io::object_store::ObjectStore>> {
+        match base_id {
+            Some(bucket_id) => {
+                let base_paths = &self.manifest.base_paths;
+                let base_path = base_paths.get(bucket_id).ok_or_else(|| {
+                    Error::invalid_input(
+                        format!("base_path id {} not found", bucket_id),
+                        location!(),
+                    )
+                })?;
+
+                // Extract the bucket URI from the name field (now contains only bucket URI, not full path)
+                let bucket_uri = base_path.name.as_ref().ok_or_else(|| {
+                    Error::invalid_input(
+                        format!("Bucket URI not found for base_id {}", bucket_id),
+                        location!(),
+                    )
+                })?;
+
+                println!("🪣 Creating ObjectStore for bucket {} with URI: '{}'", bucket_id, bucket_uri);
+
+                // Create a new ObjectStore for this bucket using the same store params as the primary dataset
+                let default_params = Default::default();
+                let store_params = self.store_params.as_ref().unwrap_or(&default_params);
+                println!("🪣 Calling ObjectStore::from_uri_and_params with URI: '{}'", bucket_uri);
+                
+                // Create a fresh registry to avoid caching issues
+                let fresh_registry = Arc::new(lance_io::object_store::ObjectStoreRegistry::default());
+                let (object_store, path) = lance_io::object_store::ObjectStore::from_uri_and_params(
+                    fresh_registry,
+                    bucket_uri,
+                    store_params,
+                ).await?;
+                println!("🪣 Created ObjectStore successfully with fresh registry, path: '{}'", path);
+                
+                // Test the object store by trying to list objects (this will show which bucket it's actually using)
+                println!("🪣 Testing object store by attempting to list root...");
+                let mut list_stream = object_store.list(None);
+                match futures::StreamExt::next(&mut list_stream).await {
+                    Some(Ok(_)) => println!("🪣 Object store list succeeded"),
+                    Some(Err(e)) => println!("🪣 Object store list failed: {}", e),
+                    None => println!("🪣 Object store list returned empty"),
+                }
+
+                Ok(object_store)
+            }
+            None => {
+                // Use the primary dataset's object store
+                Ok(self.object_store.clone())
+            }
         }
     }
 
@@ -1829,6 +1893,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                         dataset.session(),
                         dataset.commit_handler.clone(),
                         dataset.file_reader_options.clone(),
+                        dataset.store_params.clone(),
                     )?;
                     let object_store = dataset_version.object_store();
                     let path = dataset_version
@@ -1866,6 +1931,7 @@ pub(crate) fn load_new_transactions(dataset: &Dataset) -> NewTransactionResult<'
                 dataset.session(),
                 dataset.commit_handler.clone(),
                 dataset.file_reader_options.clone(),
+                dataset.store_params.clone(),
             )
         } else {
             // If we didn't get the latest manifest, we can still return the dataset

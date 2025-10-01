@@ -309,6 +309,7 @@ impl DatasetBuilder {
         let manifest = self.manifest.take();
 
         let file_reader_options = self.file_reader_options.clone();
+        let store_params = self.options.clone();
         let (object_store, base_path, commit_handler) = self.build_object_store().await?;
 
         if let Some(r) = cloned_ref {
@@ -370,6 +371,7 @@ impl DatasetBuilder {
             session,
             commit_handler,
             file_reader_options,
+            Some(store_params),
         )
     }
 }

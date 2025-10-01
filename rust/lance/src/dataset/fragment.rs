@@ -935,17 +935,44 @@ impl FileFragment {
                 .dataset
                 .data_file_dir(data_file)?
                 .child(data_file.path.as_str());
+            
+            println!("🔍 Reading data_file: path='{}', base_id={:?}", data_file.path, data_file.base_id);
+            println!("🔍 Constructed full path: '{}'", path);
+            
+            // Get the correct ObjectStore for this file's bucket
+            let object_store = self.dataset.get_object_store_for_bucket(data_file.base_id.as_ref()).await?;
+            println!("🔍 Got object store for base_id {:?}", data_file.base_id);
+            
+            // Debug: Check if this is the same object store as the primary dataset
+            let is_same_as_primary = Arc::ptr_eq(&object_store, &self.dataset.object_store);
+            println!("🔍 Is same object store as primary dataset: {}", is_same_as_primary);
+            
             let (store_scheduler, reader_priority) =
                 if let Some(scan_scheduler) = read_config.scan_scheduler.as_ref() {
-                    (
-                        scan_scheduler.clone(),
-                        read_config.reader_priority.unwrap_or(0),
-                    )
+                    // For multi-bucket files, we need to create a new scheduler with the correct object store
+                    // instead of reusing the existing one which might be tied to the primary bucket
+                    if data_file.base_id.is_some() {
+                        println!("🔍 Multi-bucket file: Creating new ScanScheduler with correct object store instead of reusing existing one");
+                        (
+                            ScanScheduler::new(
+                                object_store.clone(),
+                                SchedulerConfig::max_bandwidth(&object_store),
+                            ),
+                            read_config.reader_priority.unwrap_or(0),
+                        )
+                    } else {
+                        println!("🔍 Primary bucket file: Using existing scan_scheduler from read_config");
+                        (
+                            scan_scheduler.clone(),
+                            read_config.reader_priority.unwrap_or(0),
+                        )
+                    }
                 } else {
+                    println!("🔍 Creating new ScanScheduler with correct object store");
                     (
                         ScanScheduler::new(
-                            self.dataset.object_store.clone(),
-                            SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                            object_store.clone(),
+                            SchedulerConfig::max_bandwidth(&object_store),
                         ),
                         0,
                     )

@@ -1318,21 +1318,54 @@ impl Transaction {
                 // The additional buckets get IDs 1, 2, 3, etc.
                 for (i, uri) in data_bucket_uris.iter().enumerate() {
                     let bucket_id = (i + 1) as u32; // Start from 1, 0 is reserved for primary
-                    // Extract just the path portion from the URI for storage in manifest
-                    // Since is_dataset_root = false, we store the path that includes /data directly
-                    let path_portion = if let Ok(url) = Url::parse(uri) {
-                        format!("{}/data", url.path().trim_start_matches('/'))
+                    
+                    // Parse the URI to extract bucket and path components
+                    // Handle both full URIs (s3://bucket/path) and local file paths (/path/to/dir)
+                    let parsed_url = if uri.contains("://") {
+                        // Full URI with scheme
+                        Url::parse(uri).map_err(|e| {
+                            Error::invalid_input(
+                                format!("Invalid bucket URI '{}': {}", uri, e),
+                                location!(),
+                            )
+                        })?
                     } else {
-                        format!("{}/data", uri)
+                        // Local file path - convert to file:// URI
+                        Url::from_file_path(uri).map_err(|_| {
+                            Error::invalid_input(
+                                format!("Invalid local path '{}': cannot convert to file URI", uri),
+                                location!(),
+                            )
+                        })?
                     };
-                    println!("📋 Adding base_path: bucket {} -> {} (path: {})", bucket_id, uri, path_portion);
+                    
+                    // Extract bucket URI (scheme + host) and path separately
+                    let bucket_uri = format!("{}://{}", parsed_url.scheme(), 
+                        parsed_url.host_str().unwrap_or(""));
+                    
+                    // Extract the path portion (relative to bucket) and add /data
+                    let relative_path = if parsed_url.path().is_empty() || parsed_url.path() == "/" {
+                        "data".to_string()
+                    } else {
+                        let path = parsed_url.path().trim_start_matches('/');
+                        if path.ends_with('/') {
+                            format!("{}data", path)
+                        } else {
+                            format!("{}/data", path)
+                        }
+                    };
+                    
+                    println!("📋 Adding base_path: bucket {} -> {} (bucket: '{}', path: '{}')", bucket_id, uri, bucket_uri, relative_path);
+                    println!("📋 Storing in manifest: id={}, name='{}', path='{}', is_dataset_root={}", bucket_id, bucket_uri, relative_path, false);
+                    
+                    // Store the bucket URI in name field, relative path in path field
                     reference_paths.insert(
                         bucket_id,
                         lance_table::format::BasePath {
                             id: bucket_id,
-                            name: Some(format!("data_bucket_{}", bucket_id)),
-                            is_dataset_root: false, // Direct path to data directory
-                            path: path_portion, // Store just the path portion, not full URL
+                            name: Some(bucket_uri), // Store bucket URI only
+                            is_dataset_root: false,
+                            path: relative_path, // Store relative path here
                         },
                     );
                 }

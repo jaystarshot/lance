@@ -399,6 +399,7 @@ impl<'a> CommitBuilder<'a> {
                 fragment_bitmap,
                 metadata_cache,
                 file_reader_options: None,
+                store_params: self.store_params.clone(),
             }),
         }
     }

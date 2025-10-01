@@ -438,15 +438,38 @@ pub async fn do_write_fragments_with_manifest(
                 if let Some(manifest) = existing_manifest {
                     println!("🔍 {:?} mode: Looking up bucket_id for target_bucket_uri '{}' from existing manifest", params.mode, target_bucket_uri);
                     
+                    // Parse the target_bucket_uri to extract bucket and path components
+                    let target_parsed_url = Url::parse(target_bucket_uri).map_err(|e| {
+                        Error::invalid_input(
+                            format!("Invalid target_bucket_uri '{}': {}", target_bucket_uri, e),
+                            location!(),
+                        )
+                    })?;
+                    
+                    let target_bucket_uri_base = format!("{}://{}", target_parsed_url.scheme(), 
+                        target_parsed_url.host_str().unwrap_or(""));
+                    let target_path = if target_parsed_url.path().is_empty() || target_parsed_url.path() == "/" {
+                        "data".to_string()
+                    } else {
+                        let path = target_parsed_url.path().trim_start_matches('/');
+                        if path.ends_with('/') {
+                            format!("{}data", path)
+                        } else {
+                            format!("{}/data", path)
+                        }
+                    };
+                    
                     // Look through the manifest's base_paths to find which bucket ID matches this URI
-                    let target_path_with_data = format!("{}/data", target_bucket_uri);
                     let mut found_bucket_id = None;
                     
                     for (bucket_id, base_path) in &manifest.base_paths {
-                        println!("🔍 Checking bucket {}: path='{}' vs target='{}'", bucket_id, base_path.path, target_path_with_data);
-                        if base_path.path == target_path_with_data {
-                            found_bucket_id = Some(*bucket_id);
-                            break;
+                        if let Some(bucket_uri) = &base_path.name {
+                            println!("🔍 Checking bucket {}: bucket_uri='{}' vs target_bucket='{}', path='{}' vs target_path='{}'", 
+                                bucket_id, bucket_uri, target_bucket_uri_base, base_path.path, target_path);
+                            if bucket_uri == &target_bucket_uri_base && base_path.path == target_path {
+                                found_bucket_id = Some(*bucket_id);
+                                break;
+                            }
                         }
                     }
                     
@@ -478,7 +501,20 @@ pub async fn do_write_fragments_with_manifest(
             }
         };
         
-        (object_store, target_path, Some(bucket_id))
+        // Create object store for the target bucket URI
+        let store_params = params.store_params.clone().unwrap_or_default();
+        let store_registry = params.session.as_ref().map(|s| s.store_registry()).unwrap_or_default();
+        let (target_object_store, _) = ObjectStore::from_uri_and_params(
+            store_registry,
+            target_bucket_uri,
+            &store_params,
+        ).await?;
+        
+        let final_object_store: Arc<ObjectStore> = target_object_store;
+        let final_base_dir: Path = target_path;
+        let target_bucket_id: Option<u32> = Some(bucket_id);
+        
+        (final_object_store, final_base_dir, target_bucket_id)
     } else {
         println!("🪣 {:?} mode: Using primary bucket (no target_bucket_uri specified)", params.mode);
         (object_store, base_dir.clone(), None)

@@ -884,7 +884,7 @@ impl WriterGenerator {
             println!("📝 Writing to primary bucket at directory: {}", self.base_dir);
         }
 
-        let mut writer = if let Some(bucket_id) = self.target_bucket_id {
+        let mut writer = if let Some(_bucket_id) = self.target_bucket_id {
             // For multi-bucket writes, don't add /data directory - we'll include it in base_dir
             println!("📝 Multi-bucket write: Not adding /data directory in open_writer");
             open_writer_with_options(
@@ -1389,5 +1389,184 @@ mod tests {
         assert_eq!(reader.num_batches(), 1);
         let batch = reader.read_batch(0, .., &schema).await.unwrap();
         assert_eq!(batch, data);
+    }
+
+    #[tokio::test]
+    async fn test_multi_bucket_writer_generator() {
+        use lance_io::object_store::ObjectStore;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        // Create test schema
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+
+        // Create in-memory object store
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test/bucket2");
+
+        // Test WriterGenerator with multi-bucket configuration
+        let writer_generator = WriterGenerator::new(
+            object_store.clone(),
+            &base_dir,
+            &schema,
+            LanceFileVersion::Stable,
+            Some(2), // target_bucket_id
+        );
+
+        // Create a writer
+        let (writer, fragment) = writer_generator.new_writer().await.unwrap();
+        
+        // Verify fragment is created
+        assert_eq!(fragment.id, 0); // Temporary ID
+        
+        // Verify writer is created (we can't test much more without writing data)
+        drop(writer); // Clean up
+    }
+
+    #[tokio::test]
+    async fn test_bucket_aware_writer() {
+        use lance_io::object_store::ObjectStore;
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        // Create test data
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        
+        let batch = RecordBatch::try_new(
+            arrow_schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        ).unwrap();
+
+        // Create in-memory object store and writer
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test/bucket2");
+        
+        let inner_writer = open_writer_with_options(
+            object_store.as_ref(),
+            &schema,
+            &base_dir,
+            LanceFileVersion::Stable,
+            false, // Don't add /data
+        ).await.unwrap();
+
+        // Wrap with BucketAwareWriter
+        let bucket_id = 2u32;
+        let mut bucket_writer = BucketAwareWriter {
+            inner: inner_writer,
+            bucket_id,
+        };
+
+        // Write data
+        bucket_writer.write(&[batch]).await.unwrap();
+        
+        // Finish and check the DataFile has correct base_id
+        let (_num_rows, data_file) = bucket_writer.finish().await.unwrap();
+        
+        assert_eq!(data_file.base_id, Some(bucket_id));
+        assert!(!data_file.path.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_multi_bucket_path_parsing() {
+        // Test URI parsing logic
+        let test_cases = vec![
+            (
+                "s3://multi-bucket-test/test1/subBucket2",
+                "test1/subBucket2"
+            ),
+            (
+                "gs://my-bucket/path/to/data",
+                "path/to/data"
+            ),
+            (
+                "file:///tmp/test/bucket",
+                "tmp/test/bucket"
+            ),
+        ];
+
+        for (uri, expected_path) in test_cases {
+            let url = url::Url::parse(uri).unwrap();
+            let parsed_path = url.path().trim_start_matches('/');
+            assert_eq!(parsed_path, expected_path, "Failed for URI: {}", uri);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_params_validation() {
+        use lance_io::object_store::ObjectStore;
+        use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
+        use std::sync::Arc;
+
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "id",
+            DataType::Int32,
+            false,
+        )]));
+        let schema = Schema::try_from(arrow_schema.as_ref()).unwrap();
+        let object_store = Arc::new(ObjectStore::memory());
+        let base_dir = Path::from("test");
+
+        // Test CREATE mode validation
+        let mut params = WriteParams {
+            mode: WriteMode::Create,
+            data_path_uris: Some(vec![
+                "s3://bucket1/path1".to_string(),
+                "s3://bucket2/path2".to_string(),
+            ]),
+            target_path_uri: Some("s3://bucket1/path1".to_string()),
+            ..Default::default()
+        };
+
+        // This should be valid
+        let result = validate_write_params(&params);
+        assert!(result.is_ok());
+
+        // Test target_path_uri not in data_path_uris (should fail)
+        params.target_path_uri = Some("s3://bucket3/path3".to_string());
+        let result = validate_write_params(&params);
+        assert!(result.is_err());
+
+        // Test CREATE mode with target_path_uri but no data_path_uris (should fail)
+        params.data_path_uris = None;
+        params.target_path_uri = Some("s3://bucket1/path1".to_string());
+        let result = validate_write_params(&params);
+        assert!(result.is_err());
+    }
+
+    fn validate_write_params(params: &WriteParams) -> Result<()> {
+        // Replicate the validation logic from the main write function
+        if matches!(params.mode, WriteMode::Create) {
+            if let Some(target_path_uri) = &params.target_path_uri {
+                if let Some(data_path_uris) = &params.data_path_uris {
+                    if !data_path_uris.contains(target_path_uri) {
+                        return Err(Error::invalid_input(
+                            format!(
+                                "target_path_uri '{}' must be one of the data_path_uris {:?} in CREATE mode",
+                                target_path_uri, data_path_uris
+                            ),
+                            location!(),
+                        ));
+                    }
+                } else {
+                    return Err(Error::invalid_input(
+                        "data_path_uris must be provided when target_path_uri is specified in CREATE mode",
+                        location!(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }

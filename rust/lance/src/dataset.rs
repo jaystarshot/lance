@@ -108,6 +108,25 @@ pub use write::merge_insert::{
     MergeInsertBuilder, MergeInsertJob, MergeStats, UncommittedMergeInsert, WhenMatched,
     WhenNotMatched, WhenNotMatchedBySource,
 };
+
+/// Parse a full URI into bucket URI and relative path components
+/// 
+/// For example: "s3://multi-bucket-test/test1/subBucket2/data" 
+/// Returns: ("s3://multi-bucket-test", "test1/subBucket2/data")
+fn parse_bucket_uri_and_path(full_uri: &str) -> Result<(String, String)> {
+    let parsed_url = url::Url::parse(full_uri).map_err(|e| {
+        Error::invalid_input(
+            format!("Invalid URI '{}': {}", full_uri, e),
+            location!(),
+        )
+    })?;
+    
+    let bucket_uri = format!("{}://{}", parsed_url.scheme(), 
+        parsed_url.host_str().unwrap_or(""));
+    let relative_path = parsed_url.path().trim_start_matches('/').to_string();
+    
+    Ok((bucket_uri, relative_path))
+}
 pub use write::update::{UpdateBuilder, UpdateJob};
 #[allow(deprecated)]
 pub use write::{
@@ -1247,10 +1266,13 @@ impl Dataset {
                     )
                 })?;
 
-                println!("🔍 Multi-bucket: bucket_uri: '{:?}', path: '{}'", base_path.name, base_path.path);
+                println!("🔍 Multi-bucket: full_uri: '{}'", base_path.path);
                 
-                // For multi-bucket, the path is already relative to the bucket
-                let path = Path::parse(base_path.path.as_str())?;
+                // Parse the full URI to extract the relative path
+                let full_uri = &base_path.path;
+                let (_bucket_uri, relative_path) = parse_bucket_uri_and_path(full_uri)?;
+                
+                let path = Path::parse(&relative_path)?;
                 if base_path.is_dataset_root {
                     Ok(path.child(DATA_DIR))
                 } else {
@@ -1273,38 +1295,22 @@ impl Dataset {
                     )
                 })?;
 
-                // Extract the bucket URI from the name field (now contains only bucket URI, not full path)
-                let bucket_uri = base_path.name.as_ref().ok_or_else(|| {
-                    Error::invalid_input(
-                        format!("Bucket URI not found for base_id {}", bucket_id),
-                        location!(),
-                    )
-                })?;
+                // Parse the full URI to extract bucket URI and relative path
+                let full_uri = &base_path.path;
+                let (bucket_uri, _relative_path) = parse_bucket_uri_and_path(full_uri)?;
+                
+                println!("🪣 Creating ObjectStore for bucket {} with bucket URI: '{}'", bucket_id, bucket_uri);
 
-                println!("🪣 Creating ObjectStore for bucket {} with URI: '{}'", bucket_id, bucket_uri);
-
-                // Create a new ObjectStore for this bucket using the same store params as the primary dataset
+                // Create a new ObjectStore using the bucket URI
                 let default_params = Default::default();
                 let store_params = self.store_params.as_ref().unwrap_or(&default_params);
-                println!("🪣 Calling ObjectStore::from_uri_and_params with URI: '{}'", bucket_uri);
                 
-                // Create a fresh registry to avoid caching issues
-                let fresh_registry = Arc::new(lance_io::object_store::ObjectStoreRegistry::default());
-                let (object_store, path) = lance_io::object_store::ObjectStore::from_uri_and_params(
-                    fresh_registry,
-                    bucket_uri,
+                let (object_store, _extracted_path) = lance_io::object_store::ObjectStore::from_uri_and_params(
+                    self.session.store_registry(),
+                    &bucket_uri,
                     store_params,
                 ).await?;
-                println!("🪣 Created ObjectStore successfully with fresh registry, path: '{}'", path);
-                
-                // Test the object store by trying to list objects (this will show which bucket it's actually using)
-                println!("🪣 Testing object store by attempting to list root...");
-                let mut list_stream = object_store.list(None);
-                match futures::StreamExt::next(&mut list_stream).await {
-                    Some(Ok(_)) => println!("🪣 Object store list succeeded"),
-                    Some(Err(e)) => println!("🪣 Object store list failed: {}", e),
-                    None => println!("🪣 Object store list returned empty"),
-                }
+                println!("🪣 Created ObjectStore successfully for bucket URI: '{}'", bucket_uri);
 
                 Ok(object_store)
             }

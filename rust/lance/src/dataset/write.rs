@@ -396,8 +396,11 @@ pub async fn do_write_fragments_with_manifest(
         println!("🪣 {:?} mode: Target bucket specified -> {}", params.mode, target_path_uri);
         // Parse the target bucket URI and update the base directory
         let target_path = if let Ok(url) = Url::parse(target_path_uri) {
-            Path::parse(url.path().trim_start_matches('/'))?
+            let parsed_path = url.path().trim_start_matches('/');
+            println!("🔍 DEBUG: Original URI: '{}', URL path: '{}', parsed_path: '{}'", target_path_uri, url.path(), parsed_path);
+            Path::parse(parsed_path)?
         } else {
+            println!("🔍 DEBUG: Failed to parse as URL, treating as path: '{}'", target_path_uri);
             Path::parse(target_path_uri)?
         };
         println!("🪣 Writing to target bucket path: {}", target_path);
@@ -438,38 +441,18 @@ pub async fn do_write_fragments_with_manifest(
                 if let Some(manifest) = existing_manifest {
                     println!("🔍 {:?} mode: Looking up bucket_id for target_path_uri '{}' from existing manifest", params.mode, target_path_uri);
                     
-                    // Parse the target_path_uri to extract bucket and path components
-                    let target_parsed_url = Url::parse(target_path_uri).map_err(|e| {
-                        Error::invalid_input(
-                            format!("Invalid target_path_uri '{}': {}", target_path_uri, e),
-                            location!(),
-                        )
-                    })?;
-                    
-                    let target_path_uri_base = format!("{}://{}", target_parsed_url.scheme(), 
-                        target_parsed_url.host_str().unwrap_or(""));
-                    let target_path = if target_parsed_url.path().is_empty() || target_parsed_url.path() == "/" {
-                        "data".to_string()
-                    } else {
-                        let path = target_parsed_url.path().trim_start_matches('/');
-                        if path.ends_with('/') {
-                            format!("{}data", path)
-                        } else {
-                            format!("{}/data", path)
-                        }
-                    };
+                    // Use the target URI directly for comparison (no /data suffix)
+                    let target_uri = target_path_uri.trim_end_matches('/').to_string();
                     
                     // Look through the manifest's base_paths to find which bucket ID matches this URI
                     let mut found_bucket_id = None;
                     
                     for (bucket_id, base_path) in &manifest.base_paths {
-                        if let Some(bucket_uri) = &base_path.name {
-                            println!("🔍 Checking bucket {}: bucket_uri='{}' vs target_bucket='{}', path='{}' vs target_path='{}'", 
-                                bucket_id, bucket_uri, target_path_uri_base, base_path.path, target_path);
-                            if bucket_uri == &target_path_uri_base && base_path.path == target_path {
-                                found_bucket_id = Some(*bucket_id);
-                                break;
-                            }
+                        println!("🔍 Checking bucket {}: stored_uri='{}' vs target_uri='{}'", 
+                            bucket_id, base_path.path, target_uri);
+                        if base_path.path == target_uri {
+                            found_bucket_id = Some(*bucket_id);
+                            break;
                         }
                     }
                     
@@ -481,7 +464,7 @@ pub async fn do_write_fragments_with_manifest(
                         None => {
                             return Err(Error::invalid_input(
                                 format!(
-                                    "target_path_uri '{}' not found in existing dataset's bucket registry. Available buckets: {:?}",
+                                    "target_path_uri '{}' not found in existing dataset's bucket registry. Available URIs: {:?}",
                                     target_path_uri,
                                     manifest.base_paths.iter().map(|(id, bp)| format!("{}:{}", id, bp.path)).collect::<Vec<_>>()
                                 ),
@@ -813,9 +796,23 @@ pub async fn open_writer(
     base_dir: &Path,
     storage_version: LanceFileVersion,
 ) -> Result<Box<dyn GenericWriter>> {
+    open_writer_with_options(object_store, schema, base_dir, storage_version, true).await
+}
+
+pub async fn open_writer_with_options(
+    object_store: &ObjectStore,
+    schema: &Schema,
+    base_dir: &Path,
+    storage_version: LanceFileVersion,
+    add_data_dir: bool,
+) -> Result<Box<dyn GenericWriter>> {
     let filename = format!("{}.lance", Uuid::new_v4());
 
-    let full_path = base_dir.child(DATA_DIR).child(filename.as_str());
+    let full_path = if add_data_dir {
+        base_dir.child(DATA_DIR).child(filename.as_str())
+    } else {
+        base_dir.child(filename.as_str())
+    };
 
     let writer = if storage_version == LanceFileVersion::Legacy {
         Box::new((
@@ -887,13 +884,28 @@ impl WriterGenerator {
             println!("📝 Writing to primary bucket at directory: {}", self.base_dir);
         }
 
-        let mut writer = open_writer(
-            self.object_store.as_ref(),
-            &self.schema,
-            &self.base_dir,
-            self.storage_version,
-        )
-        .await?;
+        let mut writer = if let Some(bucket_id) = self.target_bucket_id {
+            // For multi-bucket writes, don't add /data directory - we'll include it in base_dir
+            println!("📝 Multi-bucket write: Not adding /data directory in open_writer");
+            open_writer_with_options(
+                self.object_store.as_ref(),
+                &self.schema,
+                &self.base_dir,
+                self.storage_version,
+                false, // Don't add /data for multi-bucket
+            )
+            .await?
+        } else {
+            // For primary bucket writes, add /data directory as usual
+            println!("📝 Primary bucket write: Adding /data directory in open_writer");
+            open_writer(
+                self.object_store.as_ref(),
+                &self.schema,
+                &self.base_dir,
+                self.storage_version,
+            )
+            .await?
+        };
 
         // If writing to a target bucket, wrap the writer to set base_id on DataFiles
         if let Some(bucket_id) = self.target_bucket_id {

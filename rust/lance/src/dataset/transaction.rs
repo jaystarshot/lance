@@ -1339,33 +1339,20 @@ impl Transaction {
                         })?
                     };
                     
-                    // Extract bucket URI (scheme + host) and path separately
-                    let bucket_uri = format!("{}://{}", parsed_url.scheme(), 
-                        parsed_url.host_str().unwrap_or(""));
+                    // Store the full URI directly in the path field (without /data suffix)
+                    let full_uri = uri.trim_end_matches('/').to_string();
                     
-                    // Extract the path portion (relative to bucket) and add /data
-                    let relative_path = if parsed_url.path().is_empty() || parsed_url.path() == "/" {
-                        "data".to_string()
-                    } else {
-                        let path = parsed_url.path().trim_start_matches('/');
-                        if path.ends_with('/') {
-                            format!("{}data", path)
-                        } else {
-                            format!("{}/data", path)
-                        }
-                    };
+                    println!("📋 Adding base_path: bucket {} -> {} (storing full URI: '{}')", bucket_id, uri, full_uri);
+                    println!("📋 Storing in manifest: id={}, name=None, path='{}', is_dataset_root={}", bucket_id, full_uri, false);
                     
-                    println!("📋 Adding base_path: bucket {} -> {} (bucket: '{}', path: '{}')", bucket_id, uri, bucket_uri, relative_path);
-                    println!("📋 Storing in manifest: id={}, name='{}', path='{}', is_dataset_root={}", bucket_id, bucket_uri, relative_path, false);
-                    
-                    // Store the bucket URI in name field, relative path in path field
+                    // Store the full URI directly in path field, leave name empty
                     reference_paths.insert(
                         bucket_id,
                         lance_table::format::BasePath {
                             id: bucket_id,
-                            name: Some(bucket_uri), // Store bucket URI only
-                            is_dataset_root: false,
-                            path: relative_path, // Store relative path here
+                            name: None, // No longer needed
+                            is_dataset_root: false, // This means use path directly
+                            path: full_uri, // Store full URI without /data
                         },
                     );
                 }

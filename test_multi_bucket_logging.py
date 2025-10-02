@@ -54,13 +54,13 @@ def test_multi_bucket_with_logging():
         print("="*50)
         
         # Create dataset with multi-bucket layout
-        # data_bucket_uris registers buckets in manifest, target_bucket_uri specifies where to write
+        # data_path_uris registers buckets in manifest, target_path_uri specifies where to write
         dataset = lance.write_dataset(
             data, 
             primary_uri,
             mode="create",
-            data_bucket_uris=[bucket2_uri, bucket3_uri],  # Register these buckets in manifest
-            target_bucket_uri=bucket2_uri,  # Actually write data to bucket2
+            data_path_uris=[bucket2_uri, bucket3_uri],  # Register these buckets in manifest
+            target_path_uri=bucket2_uri,  # Actually write data to bucket2
             max_rows_per_file=100  # Force multiple fragments (5 fragments total)
         )
         
@@ -98,7 +98,7 @@ def test_multi_bucket_with_logging():
             else:
                 print(f"  {bucket_name}: directory not found")
         
-        # Test APPEND mode with target_bucket_uri
+        # Test APPEND mode with target_path_uri
         print("\n" + "="*50)
         print("🪣 TESTING APPEND MODE...")
         print("="*50)
@@ -111,12 +111,12 @@ def test_multi_bucket_with_logging():
         })
         
         # Append to bucket3 this time
-        # Note: In APPEND mode, we don't provide data_bucket_uris (bucket registry already exists)
+        # Note: In APPEND mode, we don't provide data_path_uris (bucket registry already exists)
         dataset = lance.write_dataset(
             append_data,
             dataset,  # Use existing dataset
             mode="append",
-            target_bucket_uri=bucket3_uri,  # Write append data to bucket3
+            target_path_uri=bucket3_uri,  # Write append data to bucket3
             max_rows_per_file=100
         )
         
@@ -216,69 +216,69 @@ def test_validation_errors():
         'value': [f'value_{i}' for i in range(10)]
     })
     
-    # Test 1: data_bucket_uris provided but no target_bucket_uri
-    print("🧪 Test 1: data_bucket_uris without target_bucket_uri (should fail)")
+    # Test 1: data_path_uris provided but no target_path_uri
+    print("🧪 Test 1: data_path_uris without target_path_uri (should fail)")
     try:
         lance.write_dataset(
             data, 
             dataset_uri,
             mode="create",
-            data_bucket_uris=[bucket2_uri, bucket3_uri],  # Provided
-            # target_bucket_uri missing!                   # Missing
+            data_path_uris=[bucket2_uri, bucket3_uri],  # Provided
+            # target_path_uri missing!                   # Missing
             max_rows_per_file=100
         )
         print("❌ ERROR: Should have failed but didn't!")
         return False
     except Exception as e:
-        if "target_bucket_uri must also be specified" in str(e):
-            print("✅ Correctly rejected: data_bucket_uris without target_bucket_uri")
+        if "target_path_uri must also be specified" in str(e):
+            print("✅ Correctly rejected: data_path_uris without target_path_uri")
         else:
             print(f"❌ Failed with unexpected error: {e}")
             return False
     
-    # Test 2: target_bucket_uri not in data_bucket_uris
-    print("\n🧪 Test 2: target_bucket_uri not in data_bucket_uris (should fail)")
+    # Test 2: target_path_uri not in data_path_uris
+    print("\n🧪 Test 2: target_path_uri not in data_path_uris (should fail)")
     try:
         invalid_bucket = os.path.join(base_test_dir, "invalid_bucket")
         lance.write_dataset(
             data, 
             dataset_uri,
             mode="create",
-            data_bucket_uris=[bucket2_uri, bucket3_uri],  # bucket2, bucket3
-            target_bucket_uri=invalid_bucket,             # invalid_bucket (not in list)
+            data_path_uris=[bucket2_uri, bucket3_uri],  # bucket2, bucket3
+            target_path_uri=invalid_bucket,             # invalid_bucket (not in list)
             max_rows_per_file=100
         )
         print("❌ ERROR: Should have failed but didn't!")
         return False
     except Exception as e:
-        if "not found in data_bucket_uris" in str(e):
-            print("✅ Correctly rejected: target_bucket_uri not in data_bucket_uris")
+        if "not found in data_path_uris" in str(e):
+            print("✅ Correctly rejected: target_path_uri not in data_path_uris")
         else:
             print(f"❌ Failed with unexpected error: {e}")
             return False
     
-    # Test 3: target_bucket_uri provided but no data_bucket_uris in CREATE mode
-    print("\n🧪 Test 3: target_bucket_uri without data_bucket_uris in CREATE mode (should fail)")
+    # Test 3: target_path_uri provided but no data_path_uris in CREATE mode
+    print("\n🧪 Test 3: target_path_uri without data_path_uris in CREATE mode (should fail)")
     try:
         lance.write_dataset(
             data, 
             dataset_uri,
             mode="create",
-            # data_bucket_uris missing!                    # Missing
-            target_bucket_uri=bucket2_uri,               # Provided
+            # data_path_uris missing!                    # Missing
+            target_path_uri=bucket2_uri,               # Provided
             max_rows_per_file=100
         )
         print("❌ ERROR: Should have failed but didn't!")
         return False
     except Exception as e:
-        if "data_bucket_uris must also be specified" in str(e):
-            print("✅ Correctly rejected: target_bucket_uri without data_bucket_uris in CREATE mode")
+        if "data_path_uris must also be specified" in str(e):
+            print("✅ Correctly rejected: target_path_uri without data_path_uris in CREATE mode")
         else:
             print(f"❌ Failed with unexpected error: {e}")
             return False
     
-    # Test 4: data_bucket_uris provided in APPEND mode (should fail)
-    print("\n🧪 Test 4: data_bucket_uris in APPEND mode (should fail)")
+    # Test 4: data_path_uris provided in APPEND mode (should fail)
+    print("\n🧪 Test 4: data_path_uris in APPEND mode (should fail)")
     
     # First create a dataset to append to
     try:
@@ -286,29 +286,29 @@ def test_validation_errors():
             data, 
             dataset_uri,
             mode="create",
-            data_bucket_uris=[bucket2_uri, bucket3_uri],
-            target_bucket_uri=bucket2_uri,
+            data_path_uris=[bucket2_uri, bucket3_uri],
+            target_path_uri=bucket2_uri,
             max_rows_per_file=100
         )
     except Exception as e:
         print(f"❌ Failed to create base dataset for append test: {e}")
         return False
     
-    # Now try to append with data_bucket_uris (should fail)
+    # Now try to append with data_path_uris (should fail)
     try:
         lance.write_dataset(
             data, 
             base_dataset,
             mode="append",
-            data_bucket_uris=[bucket2_uri, bucket3_uri],  # Should not be provided in APPEND
-            target_bucket_uri=bucket3_uri,
+            data_path_uris=[bucket2_uri, bucket3_uri],  # Should not be provided in APPEND
+            target_path_uri=bucket3_uri,
             max_rows_per_file=100
         )
         print("❌ ERROR: Should have failed but didn't!")
         return False
     except Exception as e:
         if "should not be provided in Append mode" in str(e):
-            print("✅ Correctly rejected: data_bucket_uris in APPEND mode")
+            print("✅ Correctly rejected: data_path_uris in APPEND mode")
         else:
             print(f"❌ Failed with unexpected error: {e}")
             return False

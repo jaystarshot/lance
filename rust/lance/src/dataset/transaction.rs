@@ -96,8 +96,8 @@ pub struct Transaction {
     pub blobs_op: Option<Operation>,
     pub tag: Option<String>,
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
-    /// Additional bucket URIs for data file distribution in multi-bucket layouts
-    pub data_bucket_uris: Option<Vec<String>>,
+    /// Additional path URIs for data file distribution in multi-path layouts
+    pub data_path_uris: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -1146,7 +1146,7 @@ pub struct TransactionBuilder {
     blobs_op: Option<Operation>,
     tag: Option<String>,
     transaction_properties: Option<Arc<HashMap<String, String>>>,
-    data_bucket_uris: Option<Vec<String>>,
+    data_path_uris: Option<Vec<String>>,
 }
 
 impl TransactionBuilder {
@@ -1158,7 +1158,7 @@ impl TransactionBuilder {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
-            data_bucket_uris: None,
+            data_path_uris: None,
         }
     }
 
@@ -1185,8 +1185,8 @@ impl TransactionBuilder {
         self
     }
 
-    pub fn data_bucket_uris(mut self, data_bucket_uris: Option<Vec<String>>) -> Self {
-        self.data_bucket_uris = data_bucket_uris;
+    pub fn data_path_uris(mut self, data_path_uris: Option<Vec<String>>) -> Self {
+        self.data_path_uris = data_path_uris;
         self
     }
 
@@ -1201,7 +1201,7 @@ impl TransactionBuilder {
             blobs_op: self.blobs_op,
             tag: self.tag,
             transaction_properties: self.transaction_properties,
-            data_bucket_uris: self.data_bucket_uris,
+            data_path_uris: self.data_path_uris,
         }
     }
 }
@@ -1310,13 +1310,13 @@ impl Transaction {
             None => HashMap::new(),
         };
 
-        // If creating a new dataset and data_bucket_uris are provided, create base_paths
+        // If creating a new dataset and data_path_uris are provided, create base_paths
         if current_manifest.is_none() {
-            if let Some(data_bucket_uris) = &self.data_bucket_uris {
-                println!("📋 Creating new dataset manifest with {} additional data buckets", data_bucket_uris.len());
+            if let Some(data_path_uris) = &self.data_path_uris {
+                println!("📋 Creating new dataset manifest with {} additional data buckets", data_path_uris.len());
                 // Add the primary bucket (bucket ID 0) - this will be inferred from the dataset URI
                 // The additional buckets get IDs 1, 2, 3, etc.
-                for (i, uri) in data_bucket_uris.iter().enumerate() {
+                for (i, uri) in data_path_uris.iter().enumerate() {
                     let bucket_id = (i + 1) as u32; // Start from 1, 0 is reserved for primary
                     
                     // Parse the URI to extract bucket and path components
@@ -1371,7 +1371,7 @@ impl Transaction {
                 }
                 println!("📋 Total base_paths in manifest: {}", reference_paths.len());
             } else {
-                println!("📋 Creating new dataset manifest with single bucket (no data_bucket_uris)");
+                println!("📋 Creating new dataset manifest with single bucket (no data_path_uris)");
             }
         } else {
             println!("📋 Updating existing dataset manifest (preserving existing base_paths)");
@@ -2455,7 +2455,7 @@ impl TryFrom<pb::Transaction> for Transaction {
             } else {
                 Some(Arc::new(message.transaction_properties))
             },
-            data_bucket_uris: None, // TODO: Add protobuf support for data_bucket_uris
+            data_path_uris: None, // TODO: Add protobuf support for data_path_uris
         })
     }
 }

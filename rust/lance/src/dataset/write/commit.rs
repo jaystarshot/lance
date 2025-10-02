@@ -461,7 +461,7 @@ impl<'a> CommitBuilder<'a> {
             //TODO: handle batch transaction merges in the future
             transaction_properties: None,
             // For batch commits, we don't support multi-bucket configuration yet
-            data_bucket_uris: None,
+            data_path_uris: None,
         };
         let dataset = self.execute(merged.clone()).await?;
         Ok(BatchCommitResult { dataset, merged })
@@ -523,7 +523,7 @@ mod tests {
             read_version,
             blobs_op: None,
             tag: None,
-            data_bucket_uris: None,
+            data_path_uris: None,
             transaction_properties: None,
         }
     }
@@ -798,7 +798,7 @@ mod tests {
             blobs_op: None,
             tag: None,
             transaction_properties: None,
-            data_bucket_uris: None,
+            data_path_uris: None,
         };
         let res = CommitBuilder::new(dataset.clone())
             .execute_batch(vec![update_transaction])

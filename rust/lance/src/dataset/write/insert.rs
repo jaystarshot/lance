@@ -273,7 +273,7 @@ impl<'a> InsertBuilder<'a> {
             WriteMode::Append => Operation::Append { fragments: blob.0 },
         });
 
-        println!("🔨 Building transaction with data_bucket_uris: {:?}", context.params.data_bucket_uris);
+        println!("🔨 Building transaction with data_path_uris: {:?}", context.params.data_path_uris);
         let transaction = TransactionBuilder::new(
             context
                 .dest
@@ -284,7 +284,7 @@ impl<'a> InsertBuilder<'a> {
         )
         .blobs_op(blobs_op)
         .transaction_properties(context.params.transaction_properties.clone())
-        .data_bucket_uris(context.params.data_bucket_uris.clone())
+        .data_path_uris(context.params.data_path_uris.clone())
         .build();
         
         println!("🔨 Transaction built with {} fragments", 

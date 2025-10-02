@@ -227,17 +227,17 @@ pub struct WriteParams {
     /// this properties map will be persisted as part of Transaction object.
     pub transaction_properties: Option<Arc<HashMap<String, String>>>,
 
-    /// Additional bucket URIs for registering in the manifest during dataset creation.
-    /// When provided in CREATE mode, these bucket URIs will be registered in the manifest
-    /// as available buckets, but actual writing location is determined by target_bucket_uri.
+    /// Additional path URIs for registering in the manifest during dataset creation.
+    /// When provided in CREATE mode, these path URIs will be registered in the manifest
+    /// as available paths, but actual writing location is determined by target_path_uri.
     /// Only used in CREATE mode for manifest registration.
-    pub data_bucket_uris: Option<Vec<String>>,
+    pub data_path_uris: Option<Vec<String>>,
 
-    /// Target bucket URI for writing data files.
-    /// When provided, all new data files will be written to this specific bucket URI.
+    /// Target path URI for writing data files.
+    /// When provided, all new data files will be written to this specific path URI.
     /// Used in all modes (CREATE, APPEND, OVERWRITE) to specify where data should be written.
-    /// If not provided, data will be written to the primary bucket.
-    pub target_bucket_uri: Option<String>,
+    /// If not provided, data will be written to the primary path.
+    pub target_path_uri: Option<String>,
 }
 
 impl Default for WriteParams {
@@ -259,8 +259,8 @@ impl Default for WriteParams {
             auto_cleanup: Some(AutoCleanupParams::default()),
             skip_auto_cleanup: false,
             transaction_properties: None,
-            data_bucket_uris: None,
-            target_bucket_uri: None,
+            data_path_uris: None,
+            target_path_uri: None,
         }
     }
 }
@@ -351,74 +351,74 @@ pub async fn do_write_fragments_with_manifest(
             .boxed()
     };
 
-    // Validate multi-bucket configuration
+    // Validate multi-path configuration
     match params.mode {
         WriteMode::Create => {
-            // CREATE mode: both data_bucket_uris and target_bucket_uri must be provided together for multi-bucket mode
-            match (params.data_bucket_uris.is_some(), params.target_bucket_uri.is_some()) {
+            // CREATE mode: both data_path_uris and target_path_uri must be provided together for multi-path mode
+            match (params.data_path_uris.is_some(), params.target_path_uri.is_some()) {
                 (true, false) => {
                     return Err(Error::invalid_input(
-                        "In CREATE mode, when data_bucket_uris is provided, target_bucket_uri must also be specified to indicate where data should be written",
+                        "In CREATE mode, when data_path_uris is provided, target_path_uri must also be specified to indicate where data should be written",
                         location!(),
                     ));
                 },
                 (false, true) => {
                     return Err(Error::invalid_input(
-                        "In CREATE mode, when target_bucket_uri is provided, data_bucket_uris must also be specified to register the buckets in the manifest",
+                        "In CREATE mode, when target_path_uri is provided, data_path_uris must also be specified to register the paths in the manifest",
                         location!(),
                     ));
                 },
                 (true, true) => {
-                    // Valid: both provided for multi-bucket mode
+                    // Valid: both provided for multi-path mode
                 },
                 (false, false) => {
-                    // Valid: neither provided for single-bucket mode
+                    // Valid: neither provided for single-path mode
                 }
             }
         },
         WriteMode::Append | WriteMode::Overwrite => {
             // APPEND/OVERWRITE modes: should not register new buckets
-            if params.data_bucket_uris.is_some() {
+            if params.data_path_uris.is_some() {
                 return Err(Error::invalid_input(
                     format!(
-                        "data_bucket_uris should not be provided in {:?} mode. Bucket registry already exists in the dataset manifest. Only specify target_bucket_uri to indicate where to write new data.",
+                        "data_path_uris should not be provided in {:?} mode. Bucket registry already exists in the dataset manifest. Only specify target_path_uri to indicate where to write new data.",
                         params.mode
                     ),
                     location!(),
                 ));
             }
-            // target_bucket_uri without data_bucket_uris is valid - we'll look up bucket ID from existing manifest
+            // target_path_uri without data_path_uris is valid - we'll look up bucket ID from existing manifest
         }
     }
 
     // Handle target bucket configuration - if specified, update the base directory for writing
-    let (final_object_store, final_base_dir, target_bucket_id) = if let Some(target_bucket_uri) = &params.target_bucket_uri {
-        println!("🪣 {:?} mode: Target bucket specified -> {}", params.mode, target_bucket_uri);
+    let (final_object_store, final_base_dir, target_bucket_id) = if let Some(target_path_uri) = &params.target_path_uri {
+        println!("🪣 {:?} mode: Target bucket specified -> {}", params.mode, target_path_uri);
         // Parse the target bucket URI and update the base directory
-        let target_path = if let Ok(url) = Url::parse(target_bucket_uri) {
+        let target_path = if let Ok(url) = Url::parse(target_path_uri) {
             Path::parse(url.path().trim_start_matches('/'))?
         } else {
-            Path::parse(target_bucket_uri)?
+            Path::parse(target_path_uri)?
         };
         println!("🪣 Writing to target bucket path: {}", target_path);
         
         // Find the bucket ID for this target URI
         let bucket_id = match params.mode {
             WriteMode::Create => {
-                // CREATE mode: use data_bucket_uris to determine bucket ID (both are guaranteed to exist by validation above)
-                if let Some(data_bucket_uris) = &params.data_bucket_uris {
-                    println!("🔍 CREATE mode: Looking for target_bucket_uri '{}' in data_bucket_uris: {:?}", target_bucket_uri, data_bucket_uris);
-                    let position = data_bucket_uris.iter().position(|uri| {
-                        let matches = uri == target_bucket_uri;
-                        println!("🔍 Comparing '{}' == '{}': {}", uri, target_bucket_uri, matches);
+                // CREATE mode: use data_path_uris to determine bucket ID (both are guaranteed to exist by validation above)
+                if let Some(data_path_uris) = &params.data_path_uris {
+                    println!("🔍 CREATE mode: Looking for target_path_uri '{}' in data_path_uris: {:?}", target_path_uri, data_path_uris);
+                    let position = data_path_uris.iter().position(|uri| {
+                        let matches = uri == target_path_uri;
+                        println!("🔍 Comparing '{}' == '{}': {}", uri, target_path_uri, matches);
                         matches
                     });
                     println!("🔍 Found position: {:?}", position);
                     let bucket_id = position.map(|pos| (pos + 1) as u32).ok_or_else(|| {
                         Error::invalid_input(
                             format!(
-                                "target_bucket_uri '{}' not found in data_bucket_uris {:?}. The target bucket must be one of the registered buckets.",
-                                target_bucket_uri, data_bucket_uris
+                                "target_path_uri '{}' not found in data_path_uris {:?}. The target bucket must be one of the registered buckets.",
+                                target_path_uri, data_path_uris
                             ),
                             location!(),
                         )
@@ -428,7 +428,7 @@ pub async fn do_write_fragments_with_manifest(
                 } else {
                     // This should never happen due to validation above, but just in case
                     return Err(Error::invalid_input(
-                        "Internal error: target_bucket_uri provided but data_bucket_uris is None in CREATE mode",
+                        "Internal error: target_path_uri provided but data_path_uris is None in CREATE mode",
                         location!(),
                     ));
                 }
@@ -436,17 +436,17 @@ pub async fn do_write_fragments_with_manifest(
             WriteMode::Append | WriteMode::Overwrite => {
                 // APPEND/OVERWRITE modes: look up bucket ID from existing manifest
                 if let Some(manifest) = existing_manifest {
-                    println!("🔍 {:?} mode: Looking up bucket_id for target_bucket_uri '{}' from existing manifest", params.mode, target_bucket_uri);
+                    println!("🔍 {:?} mode: Looking up bucket_id for target_path_uri '{}' from existing manifest", params.mode, target_path_uri);
                     
-                    // Parse the target_bucket_uri to extract bucket and path components
-                    let target_parsed_url = Url::parse(target_bucket_uri).map_err(|e| {
+                    // Parse the target_path_uri to extract bucket and path components
+                    let target_parsed_url = Url::parse(target_path_uri).map_err(|e| {
                         Error::invalid_input(
-                            format!("Invalid target_bucket_uri '{}': {}", target_bucket_uri, e),
+                            format!("Invalid target_path_uri '{}': {}", target_path_uri, e),
                             location!(),
                         )
                     })?;
                     
-                    let target_bucket_uri_base = format!("{}://{}", target_parsed_url.scheme(), 
+                    let target_path_uri_base = format!("{}://{}", target_parsed_url.scheme(), 
                         target_parsed_url.host_str().unwrap_or(""));
                     let target_path = if target_parsed_url.path().is_empty() || target_parsed_url.path() == "/" {
                         "data".to_string()
@@ -465,8 +465,8 @@ pub async fn do_write_fragments_with_manifest(
                     for (bucket_id, base_path) in &manifest.base_paths {
                         if let Some(bucket_uri) = &base_path.name {
                             println!("🔍 Checking bucket {}: bucket_uri='{}' vs target_bucket='{}', path='{}' vs target_path='{}'", 
-                                bucket_id, bucket_uri, target_bucket_uri_base, base_path.path, target_path);
-                            if bucket_uri == &target_bucket_uri_base && base_path.path == target_path {
+                                bucket_id, bucket_uri, target_path_uri_base, base_path.path, target_path);
+                            if bucket_uri == &target_path_uri_base && base_path.path == target_path {
                                 found_bucket_id = Some(*bucket_id);
                                 break;
                             }
@@ -475,14 +475,14 @@ pub async fn do_write_fragments_with_manifest(
                     
                     match found_bucket_id {
                         Some(bucket_id) => {
-                            println!("🔍 Found bucket_id {} for target_bucket_uri '{}'", bucket_id, target_bucket_uri);
+                            println!("🔍 Found bucket_id {} for target_path_uri '{}'", bucket_id, target_path_uri);
                             bucket_id
                         },
                         None => {
                             return Err(Error::invalid_input(
                                 format!(
-                                    "target_bucket_uri '{}' not found in existing dataset's bucket registry. Available buckets: {:?}",
-                                    target_bucket_uri,
+                                    "target_path_uri '{}' not found in existing dataset's bucket registry. Available buckets: {:?}",
+                                    target_path_uri,
                                     manifest.base_paths.iter().map(|(id, bp)| format!("{}:{}", id, bp.path)).collect::<Vec<_>>()
                                 ),
                                 location!(),
@@ -492,8 +492,8 @@ pub async fn do_write_fragments_with_manifest(
                 } else {
                     return Err(Error::invalid_input(
                         format!(
-                            "Cannot use target_bucket_uri '{}' in {:?} mode without existing dataset manifest",
-                            target_bucket_uri, params.mode
+                            "Cannot use target_path_uri '{}' in {:?} mode without existing dataset manifest",
+                            target_path_uri, params.mode
                         ),
                         location!(),
                     ));
@@ -506,7 +506,7 @@ pub async fn do_write_fragments_with_manifest(
         let store_registry = params.session.as_ref().map(|s| s.store_registry()).unwrap_or_default();
         let (target_object_store, _) = ObjectStore::from_uri_and_params(
             store_registry,
-            target_bucket_uri,
+            target_path_uri,
             &store_params,
         ).await?;
         
@@ -516,16 +516,16 @@ pub async fn do_write_fragments_with_manifest(
         
         (final_object_store, final_base_dir, target_bucket_id)
     } else {
-        println!("🪣 {:?} mode: Using primary bucket (no target_bucket_uri specified)", params.mode);
+        println!("🪣 {:?} mode: Using primary bucket (no target_path_uri specified)", params.mode);
         (object_store, base_dir.clone(), None)
     };
     
     let writer_generator = WriterGenerator::new(final_object_store, &final_base_dir, schema, storage_version, target_bucket_id);
     
-    // For CREATE mode, data_bucket_uris will be registered in the manifest (handled in transaction.rs)
-    if matches!(params.mode, WriteMode::Create) && params.data_bucket_uris.is_some() {
+    // For CREATE mode, data_path_uris will be registered in the manifest (handled in transaction.rs)
+    if matches!(params.mode, WriteMode::Create) && params.data_path_uris.is_some() {
         println!("🪣 CREATE mode: {} additional buckets will be registered in manifest", 
-                 params.data_bucket_uris.as_ref().unwrap().len());
+                 params.data_path_uris.as_ref().unwrap().len());
     }
     let mut writer: Option<Box<dyn GenericWriter>> = None;
     let mut num_rows_in_current_file = 0;
@@ -854,8 +854,6 @@ struct WriterGenerator {
     base_dir: Path,
     schema: Schema,
     storage_version: LanceFileVersion,
-    /// Fragment counter for bucket selection
-    fragment_counter: std::sync::atomic::AtomicU32,
     /// Target bucket ID (if writing to a specific bucket)
     target_bucket_id: Option<u32>,
 }
@@ -873,24 +871,20 @@ impl WriterGenerator {
             base_dir: base_dir.clone(),
             schema: schema.clone(),
             storage_version,
-            fragment_counter: std::sync::atomic::AtomicU32::new(0),
             target_bucket_id,
         }
     }
 
 
     pub async fn new_writer(&self) -> Result<(Box<dyn GenericWriter>, Fragment)> {
-        // Get the next fragment ID for bucket selection
-        let fragment_id = self.fragment_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        
         // Use temporary ID 0; will assign actual ID later.
         let fragment = Fragment::new(0);
 
         // Simple single bucket mode - write to the configured base directory
         if let Some(bucket_id) = self.target_bucket_id {
-            println!("📝 Fragment {} writing to target bucket {} at directory: {}", fragment_id, bucket_id, self.base_dir);
+            println!("📝 Writing to target bucket {} at directory: {}", bucket_id, self.base_dir);
         } else {
-            println!("📝 Fragment {} writing to primary bucket at directory: {}", fragment_id, self.base_dir);
+            println!("📝 Writing to primary bucket at directory: {}", self.base_dir);
         }
 
         let mut writer = open_writer(
@@ -910,7 +904,7 @@ impl WriterGenerator {
             println!("📝 Wrapped writer with BucketAwareWriter for bucket {}", bucket_id);
         }
 
-        println!("✅ Writer created for fragment {}", fragment_id);
+        println!("✅ Writer created");
         Ok((writer, fragment))
     }
 }

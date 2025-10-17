@@ -1,11 +1,11 @@
 [project]
-name = "pylance"
+name = "jay-lance"
 dynamic = ["version"]
 dependencies = ["pyarrow>=14", "numpy>=1.22"]
-description = "python wrapper for Lance columnar format"
-authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
+description = "python wrapper for Lance columnar format (fork by Jay)"
+authors = [{ name = "Jay Narale", email = "jay.narale@uber.com" }]
 license = { file = "LICENSE" }
-repository = "https://github.com/lancedb/lance"
+repository = "https://github.com/yourusername/lance"
 readme = "README.md"
 requires-python = ">=3.9"
 keywords = [

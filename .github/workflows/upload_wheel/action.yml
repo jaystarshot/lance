@@ -18,8 +18,9 @@ inputs:
     required: true
     description: "release token for the repo"
   fury_token:
-    required: true
+    required: false
     description: "release token for the fury repo"
+    default: "dummy"
 
 runs:
   using: "composite"

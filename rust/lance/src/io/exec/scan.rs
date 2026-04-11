@@ -268,10 +268,11 @@ impl LanceStream {
             file_fragments = filtered_fragments;
         }
 
-        let scan_scheduler = ScanScheduler::new(
-            dataset.object_store.clone(),
-            SchedulerConfig::new(config.io_buffer_size),
-        );
+        let mut scheduler_config = SchedulerConfig::new(config.io_buffer_size);
+        if let Some(cache) = dataset.session.data_cache.as_ref() {
+            scheduler_config = scheduler_config.with_data_cache(cache.clone());
+        }
+        let scan_scheduler = ScanScheduler::new(dataset.object_store.clone(), scheduler_config);
 
         let scan_scheduler_clone = scan_scheduler.clone();
 

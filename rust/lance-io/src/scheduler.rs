@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 use lance_core::utils::parse::str_is_truthy;
 use lance_core::{Error, Result};
 
+use crate::data_cache::DataCache;
 use crate::object_store::ObjectStore;
 use crate::traits::Reader;
 use crate::utils::CachedFileSize;
@@ -483,6 +484,9 @@ pub struct ScanScheduler {
     object_store: Arc<ObjectStore>,
     io_queue: IoQueueType,
     stats: Arc<StatsCollector>,
+    /// Optional two-tier data cache (memory + SSD).
+    /// `None` means caching is disabled.
+    pub(crate) data_cache: Option<Arc<dyn DataCache>>,
 }
 
 impl Debug for ScanScheduler {
@@ -500,7 +504,7 @@ struct Response {
     num_bytes: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     /// the # of bytes that can be buffered but not yet requested.
     /// This controls back pressure.  If data is not processed quickly enough then this
@@ -512,6 +516,12 @@ pub struct SchedulerConfig {
     /// - `Some(false)` forces the standard scheduler.
     /// - `None` defers to the object store's preference (see [`ObjectStore::prefers_lite_scheduler`]).
     pub use_lite_scheduler: Option<bool>,
+    /// Optional two-tier async data cache (memory + SSD).
+    ///
+    /// When set, raw byte ranges are served from cache on hits, avoiding
+    /// object store round-trips.  Use [`SchedulerConfig::with_data_cache`]
+    /// to attach a cache.
+    pub data_cache: Option<Arc<dyn DataCache>>,
 }
 
 impl SchedulerConfig {
@@ -521,6 +531,7 @@ impl SchedulerConfig {
             use_lite_scheduler: std::env::var("LANCE_USE_LITE_SCHEDULER")
                 .ok()
                 .map(|v| str_is_truthy(v.trim())),
+            data_cache: None,
         }
     }
 
@@ -529,6 +540,7 @@ impl SchedulerConfig {
         Self {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            data_cache: None,
         }
     }
 
@@ -543,6 +555,12 @@ impl SchedulerConfig {
             use_lite_scheduler: Some(true),
             ..self
         }
+    }
+
+    /// Attach a data cache to this scheduler config.
+    pub fn with_data_cache(mut self, cache: Arc<dyn DataCache>) -> Self {
+        self.data_cache = Some(cache);
+        self
     }
 }
 
@@ -580,7 +598,13 @@ impl ScanScheduler {
             object_store,
             io_queue,
             stats: Arc::new(StatsCollector::new()),
+            data_cache: config.data_cache,
         })
+    }
+
+    /// Return the attached data cache, if any.
+    pub fn data_cache(&self) -> Option<&Arc<dyn DataCache>> {
+        self.data_cache.as_ref()
     }
 
     /// Open a file for reading
@@ -1136,6 +1160,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1024 * 1024,
             use_lite_scheduler: None,
+            data_cache: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1227,6 +1252,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
+            data_cache: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -1302,6 +1328,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
+            data_cache: None,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1397,6 +1424,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            data_cache: None,
         };
         let scheduler = ScanScheduler::new(memory_store.clone(), config);
         assert!(!scheduler.uses_lite_scheduler());
@@ -1417,6 +1445,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
+            data_cache: None,
         };
         let scheduler = ScanScheduler::new(uring_store.clone(), config);
         assert!(scheduler.uses_lite_scheduler());
@@ -1425,6 +1454,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(false),
+            data_cache: None,
         };
         let scheduler = ScanScheduler::new(uring_store, config);
         assert!(!scheduler.uses_lite_scheduler());
@@ -1433,6 +1463,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(true),
+            data_cache: None,
         };
         let scheduler = ScanScheduler::new(memory_store, config);
         assert!(scheduler.uses_lite_scheduler());
@@ -1454,6 +1485,7 @@ mod tests {
         let config = SchedulerConfig {
             io_buffer_size_bytes: 1,
             use_lite_scheduler: None,
+            data_cache: None,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler

@@ -13,6 +13,7 @@ use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
+use lance_io::data_cache::DataCacheConfig;
 use lance_io::object_store::{
     DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
     ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
@@ -593,20 +594,41 @@ impl DatasetBuilder {
         }
 
         let index_cache_backend = self.index_cache_backend.take();
+
+        // Parse data cache config from the merged storage options before the
+        // object store consumes them.  Keys are Lance-specific and not forwarded
+        // to cloud SDKs.
+        let data_cache_config = self
+            .options
+            .storage_options()
+            .and_then(DataCacheConfig::from_storage_options);
+
         let session = match self.session.as_ref() {
             Some(session) => session.clone(),
-            None => match index_cache_backend {
-                Some(backend) => Arc::new(Session::with_index_cache_backend(
-                    backend,
-                    self.metadata_cache_size_bytes,
-                    Default::default(),
-                )),
-                None => Arc::new(Session::new(
-                    self.index_cache_size_bytes,
-                    self.metadata_cache_size_bytes,
-                    Default::default(),
-                )),
-            },
+            None => {
+                let s = match index_cache_backend {
+                    Some(backend) => Session::with_index_cache_backend(
+                        backend,
+                        self.metadata_cache_size_bytes,
+                        Default::default(),
+                    ),
+                    None => Session::new(
+                        self.index_cache_size_bytes,
+                        self.metadata_cache_size_bytes,
+                        Default::default(),
+                    ),
+                };
+                // Attach data cache when configured.
+                // TODO: replace with real MemoryDataCache::new(&cfg) once the
+                // memory and SSD tier implementations are built.
+                let s = if let Some(cfg) = data_cache_config {
+                    let _ = cfg; // config parsed and validated; cache wired in next PR
+                    s
+                } else {
+                    s
+                };
+                std::sync::Arc::new(s)
+            }
         };
 
         let target_ref = self.version.clone();

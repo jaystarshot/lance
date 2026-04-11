@@ -965,4 +965,56 @@ mod tests {
         );
         assert_eq!(stats.current_bytes, 1); // "x" = 1 byte
     }
+
+    /// Regression test for the saturating_sub guard in maybe_evict and
+    /// remove_entry.  Without it, two concurrent evictions subtracting from
+    /// total_bytes simultaneously could wrap a u64 to near u64::MAX, making
+    /// the cache think it has effectively infinite free space and stop evicting.
+    ///
+    /// We verify that after heavy concurrent load total_bytes never approaches
+    /// u64::MAX (which would indicate a wrap-around).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_total_bytes_no_underflow_under_concurrent_eviction() {
+        // Very small cap forces constant eviction pressure.
+        let cap = 512 * 1024u64;        // 512 KiB
+        let entry_size = 64 * 1024u64;  // 64 KiB — 8 entries fill the cache
+        let cache = Arc::new(MemoryCache::new(cap));
+
+        // 8 threads each load a distinct stream of keys, all competing for the
+        // same tiny cache.  Every insert triggers maybe_evict; concurrent calls
+        // to fetch_sub on total_bytes used to be able to race and underflow.
+        let mut handles = Vec::new();
+        for thread_id in 0..8u64 {
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                for i in 0..64u64 {
+                    let offset = (thread_id * 1000 + i) * entry_size;
+                    let data = Bytes::from(vec![0u8; entry_size as usize]);
+                    cache
+                        .get_or_load(
+                            key(thread_id, offset, entry_size),
+                            Box::pin(async move { Ok(data) }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let stats = cache.stats();
+
+        // If total_bytes wrapped, it would be close to u64::MAX (≥ 1 TiB).
+        // A sane cache under 512 KiB cap should never report anywhere near that.
+        let one_tib = 1u64 << 40;
+        assert!(
+            stats.current_bytes < one_tib,
+            "u64 underflow detected: total_bytes wrapped to {}",
+            stats.current_bytes
+        );
+        assert!(stats.evictions > 0, "expected evictions under constant pressure");
+    }
 }

@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::path::Path;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 
 use lance_core::Result;
 
@@ -216,13 +216,16 @@ impl CacheShardInner {
     }
 
     /// Free at least `target_bytes` from this shard using the clock-hand
-    /// algorithm.  Returns bytes freed.
+    /// algorithm.  Returns `(bytes_freed, evicted_entries)` where
+    /// `evicted_entries` carries the key + live bytes of each evicted entry
+    /// so the caller can forward them to the SSD tier — Velox's lazy write
+    /// pattern (`ssd_saveable` entries forwarded to `saveToSsd()`).
     ///
     /// Direct port of Velox's `CacheShard::evict`.
-    fn evict(&mut self, target_bytes: u64) -> u64 {
+    fn evict(&mut self, target_bytes: u64) -> (u64, Vec<(DataCacheKey, Bytes)>) {
         let n = self.eviction_ring.len();
         if n == 0 {
-            return 0;
+            return (0, Vec::new());
         }
 
         // Recalibrate periodically — every ~ring_len/4 events.
@@ -235,6 +238,7 @@ impl CacheShardInner {
         let now = now_ms();
         let mut freed = 0u64;
         let mut checked = 0;
+        let mut evicted: Vec<(DataCacheKey, Bytes)> = Vec::new();
 
         while freed < target_bytes && checked < n {
             let idx = self.clock_hand % n;
@@ -289,10 +293,15 @@ impl CacheShardInner {
                 continue; // too hot — below eviction threshold
             }
 
-            // Evict: remove from map and zero data_size so that if this entry
-            // remains in the eviction ring (still referenced by waiters) a
-            // subsequent sweep skips it without double-counting.
+            // Evict: extract bytes for SSD write, remove from map, zero data_size.
+            // Bytes are extracted BEFORE zeroing data_size so the SSD writer
+            // receives valid data — Velox's ssd_saveable forward pattern.
             if self.entries.remove(&entry.key).is_some() {
+                // Grab the bytes from the watch channel while we still hold
+                // the Arc (strong_count > 0 so the sender is alive).
+                if let LoadState::Loaded(bytes) = entry.state_tx.borrow().clone() {
+                    evicted.push((entry.key.clone(), bytes));
+                }
                 entry.data_size.store(0, Ordering::Relaxed);
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(size);
                 freed += size;
@@ -307,7 +316,7 @@ impl CacheShardInner {
             self.clock_hand = self.clock_hand.min(self.eviction_ring.len());
         }
 
-        freed
+        (freed, evicted)
     }
 }
 
@@ -348,16 +357,16 @@ pub struct MemoryCacheStats {
 /// blocked while waiting.
 pub struct MemoryCache {
     shards: Vec<CacheShard>,
-    /// Bit-mask for fast shard selection: `hash & shard_mask`.
-    /// Always `num_shards - 1` since num_shards is a power of two.
     shard_mask: u64,
-    /// Hard upper bound on total cached bytes across all shards.
     max_bytes: u64,
-    /// Running total of loaded bytes (updated atomically outside shard locks).
     total_bytes: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
+    /// When set, evicted entries are forwarded here so the SSD tier can
+    /// persist them asynchronously — Velox's lazy `ssd_saveable` write pattern.
+    /// Uses a bounded channel with `try_send` so eviction never blocks.
+    eviction_tx: Option<mpsc::Sender<(DataCacheKey, Bytes)>>,
 }
 
 impl std::fmt::Debug for MemoryCache {
@@ -383,6 +392,17 @@ impl MemoryCache {
     /// # Panics
     /// Panics if `num_shards` is zero or not a power of two.
     pub fn new_with_shards(max_bytes: u64, num_shards: usize) -> Arc<Self> {
+        Self::with_eviction_channel(max_bytes, num_shards, None)
+    }
+
+    /// Create a cache that forwards evicted entries to `eviction_tx` for
+    /// lazy SSD persistence — Velox's `ssd_saveable` background write pattern.
+    /// The channel is bounded; if full, eviction writes are dropped (best-effort).
+    pub fn with_eviction_channel(
+        max_bytes: u64,
+        num_shards: usize,
+        eviction_tx: Option<mpsc::Sender<(DataCacheKey, Bytes)>>,
+    ) -> Arc<Self> {
         assert!(num_shards > 0, "num_shards must be positive");
         assert!(
             num_shards.is_power_of_two(),
@@ -398,6 +418,7 @@ impl MemoryCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
+            eviction_tx,
         })
     }
 
@@ -562,7 +583,7 @@ impl MemoryCache {
             if total_freed >= overage {
                 break;
             }
-            let freed = shard.inner.lock().unwrap().evict(per_shard);
+            let (freed, evicted) = shard.inner.lock().unwrap().evict(per_shard);
             if freed > 0 {
                 // Use fetch_update with saturating_sub to guard against
                 // concurrent evictions both subtracting from total_bytes
@@ -574,6 +595,16 @@ impl MemoryCache {
                     .ok();
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 total_freed += freed;
+            }
+            // Forward evicted bytes to SSD tier (lazy write — Velox's ssd_saveable pattern).
+            // Using try_send: if the channel is full we drop the write rather than
+            // block the eviction path.  The data remains in the object store.
+            if !evicted.is_empty() {
+                if let Some(tx) = &self.eviction_tx {
+                    for item in evicted {
+                        tx.try_send(item).ok();
+                    }
+                }
             }
         }
     }

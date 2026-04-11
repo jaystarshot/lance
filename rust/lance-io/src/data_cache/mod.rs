@@ -209,10 +209,14 @@ pub struct TieredDataCache {
 impl TieredDataCache {
     /// Build a `TieredDataCache` from `config`.
     ///
-    /// Creates the SSD tier and cleans its directory if `ssd_cache_dir` is set.
+    /// When the SSD tier is enabled:
+    /// * A bounded channel (`eviction_channel_capacity` = 256) is created.
+    /// * `MemoryCache` is given the sender — evicted entries are forwarded here.
+    /// * A background tokio task drains the channel and writes to `SsdCache`.
+    ///
+    /// This is Velox's lazy write pattern: data reaches the SSD only when the
+    /// memory tier can no longer hold it, not on every initial fetch.
     pub async fn new(config: &DataCacheConfig) -> Result<Arc<Self>> {
-        let memory = MemoryCache::new_with_shards(config.max_memory_bytes, config.num_shards);
-
         let ssd = if let Some(dir) = &config.ssd_cache_dir {
             let ssd_config = SsdCacheConfig {
                 cache_dir: dir.clone(),
@@ -222,6 +226,30 @@ impl TieredDataCache {
             Some(SsdCache::new(ssd_config).await?)
         } else {
             None
+        };
+
+        // If we have an SSD tier, wire the eviction channel so that memory
+        // evictions are forwarded to SSD asynchronously.
+        const EVICTION_CHANNEL_CAPACITY: usize = 256;
+        let memory = if let Some(ssd_arc) = ssd.clone() {
+            let (tx, mut rx) =
+                tokio::sync::mpsc::channel::<(DataCacheKey, Bytes)>(EVICTION_CHANNEL_CAPACITY);
+
+            // Background task: drain the eviction channel → write to SSD.
+            // Exits automatically when MemoryCache is dropped (sender closes).
+            tokio::spawn(async move {
+                while let Some((key, bytes)) = rx.recv().await {
+                    ssd_arc.insert(key, bytes).await;
+                }
+            });
+
+            memory::MemoryCache::with_eviction_channel(
+                config.max_memory_bytes,
+                config.num_shards,
+                Some(tx),
+            )
+        } else {
+            memory::MemoryCache::new_with_shards(config.max_memory_bytes, config.num_shards)
         };
 
         Ok(Arc::new(Self {
@@ -248,17 +276,18 @@ impl DataCache for TieredDataCache {
         let file_id = self.file_ids.get_or_intern(path);
         let key = DataCacheKey { file_id, offset, length };
 
-        // If SSD tier is enabled, wrap the remote loader so that on an L1 miss
-        // we check L2 before going to the object store.
+        // If SSD tier is enabled, check L2 (SSD) on L1 (memory) miss before
+        // falling back to the object store.  SSD writes now happen lazily via
+        // the eviction channel — NOT here on every fetch.
         let effective_loader: BoxFuture<'a, Result<Bytes>> = if let Some(ssd) = &self.ssd {
             let key_for_ssd = key.clone();
             Box::pin(async move {
                 if let Some(bytes) = ssd.get(&key_for_ssd).await {
-                    return Ok(bytes);
+                    return Ok(bytes); // L2 hit — no object store call
                 }
-                let bytes = loader.await?;
-                ssd.insert(key_for_ssd, bytes.clone()).await;
-                Ok(bytes)
+                // L2 miss — fetch from object store.
+                // SSD write happens when this entry is later evicted from memory.
+                loader.await
             })
         } else {
             loader
@@ -374,7 +403,8 @@ mod tests {
         let entry_size = 256 * 1024u64; // 256 KiB
         let n = 4u64; // 4 entries — well above the 512 KiB memory limit
 
-        // Load all entries — they go to memory AND SSD.
+        // Load all entries — they go to memory first.  With lazy writes, SSD
+        // receives them only when memory evicts (via the background channel).
         for i in 0..n {
             let pattern = Bytes::from(vec![(i * 37 % 256) as u8; entry_size as usize]);
             let p = pattern.clone();
@@ -388,6 +418,10 @@ mod tests {
                 .await
                 .unwrap();
         }
+
+        // Give the background SSD writer time to drain the eviction channel.
+        // In production the decoder pipeline naturally provides this gap.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Verify all entries are readable (some from memory, some from SSD).
         // Data must match original pattern exactly — this is the core invariant.

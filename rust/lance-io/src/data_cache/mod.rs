@@ -83,9 +83,7 @@ pub struct DataCacheConfig {
     pub max_memory_bytes: u64,
 
     /// Number of independent memory-tier shards.  Must be a power of two.
-    /// Higher values reduce mutex contention on many-core machines at the cost
-    /// of slightly more memory overhead.  Defaults to [`DEFAULT_NUM_SHARDS`]
-    /// (16) — the same default as Velox's `AsyncDataCache`.
+    /// Defaults to [`memory::DEFAULT_NUM_SHARDS`] (16).
     pub num_shards: usize,
 
     /// Directory on a local SSD for the on-disk (L2) cache tier.
@@ -95,6 +93,10 @@ pub struct DataCacheConfig {
     /// Maximum bytes the SSD tier may consume.
     /// Ignored when `ssd_cache_dir` is `None`.
     pub ssd_max_bytes: u64,
+
+    /// Number of SSD shard files.  Must be a positive power of two.
+    /// Defaults to [`ssd::DEFAULT_NUM_SSD_SHARDS`] (4).
+    pub ssd_num_shards: usize,
 }
 
 impl DataCacheConfig {
@@ -102,6 +104,7 @@ impl DataCacheConfig {
     pub const KEY_NUM_SHARDS: &'static str = "memory_cache_num_shards";
     pub const KEY_SSD_CACHE_DIR: &'static str = "ssd_cache_dir";
     pub const KEY_SSD_CACHE_SIZE_MB: &'static str = "ssd_cache_size_mb";
+    pub const KEY_SSD_NUM_SHARDS: &'static str = "ssd_cache_num_shards";
 
     /// Parse from the merged `storage_options` map.
     ///
@@ -131,11 +134,17 @@ impl DataCacheConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(memory::DEFAULT_NUM_SHARDS);
 
+        let ssd_num_shards = opts
+            .get(Self::KEY_SSD_NUM_SHARDS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(ssd::DEFAULT_NUM_SSD_SHARDS);
+
         Some(Self {
             max_memory_bytes: max_memory_bytes.unwrap_or(256 * 1024 * 1024),
             num_shards,
             ssd_cache_dir,
             ssd_max_bytes,
+            ssd_num_shards,
         })
     }
 }
@@ -208,6 +217,7 @@ impl TieredDataCache {
             let ssd_config = SsdCacheConfig {
                 cache_dir: dir.clone(),
                 max_bytes: config.ssd_max_bytes,
+                num_shards: config.ssd_num_shards,
             };
             Some(SsdCache::new(ssd_config).await?)
         } else {
@@ -309,6 +319,7 @@ mod tests {
             num_shards: memory::DEFAULT_NUM_SHARDS,
             ssd_cache_dir: None,
             ssd_max_bytes: 0,
+            ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test/file.lance");

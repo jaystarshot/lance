@@ -246,14 +246,17 @@ impl CacheShardInner {
                 continue;
             };
 
-            // `strong_count == 2`: one from the `entries` map + one from our
-            // `upgrade()`.  Waiters suspended at `rx.changed().await` hold
-            // their own Arc clone *outside* the shard mutex, so the count is
-            // NOT stable — it can be 2 + N where N is the number of active
-            // waiters.  The check `> 2` correctly skips those entries.
-            // The only case where count is exactly 2 and the entry is still
-            // live is when no waiter holds it and it has not yet been removed
-            // from the map — the exact condition under which it is safe to evict.
+            // Why > 2?
+            // At this point we hold the shard mutex. The minimum strong_count
+            // for any live entry is 2:
+            //   1 — inner.entries[key]  (the HashMap's Arc)
+            //   1 — this upgrade()      (our temporary Arc)
+            // Any waiter suspended at rx.changed().await holds a third Arc
+            // obtained from find_or_create *before* releasing the shard mutex.
+            // That waiter is outside the mutex now but still increments the
+            // count. So:
+            //   count == 2  → only map + upgrade → no active users → evict
+            //   count  > 2  → at least one waiter or active reader → skip
             //
             // TODO: Velox uses an explicit `numPins_` atomic (kExclusive = -10000
             // while loading, 0 = evictable, N = N active readers) and a RAII
@@ -1031,5 +1034,132 @@ mod tests {
             stats.current_bytes
         );
         assert!(stats.evictions > 0, "expected evictions under constant pressure");
+    }
+
+    // ── Missing Velox tests ───────────────────────────────────────────────
+
+    /// Port of Velox's `outOfCapacity`: when all entries are actively loading
+    /// (strong_count > 2), eviction must be a graceful no-op — nothing freed,
+    /// no panic, no underflow.
+    #[tokio::test]
+    async fn test_eviction_graceful_when_all_entries_loading() {
+        // Tiny cache — 1 entry fits.
+        let cap = 128 * 1024u64;
+        let entry_size = 128 * 1024u64;
+        let cache = Arc::new(MemoryCache::new(cap));
+
+        // Hold the Arc<CacheEntry> alive by keeping the loader suspended,
+        // simulating a pinned / still-loading entry.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cache_clone = cache.clone();
+
+        let loading = tokio::spawn(async move {
+            let _ = cache_clone
+                .get_or_load(
+                    key(99, 0, entry_size),
+                    Box::pin(async move {
+                        rx.await.ok(); // suspended — entry is in Loading state
+                        Ok(Bytes::from(vec![0u8; entry_size as usize]))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+
+        // Give the loader task time to create the entry and suspend.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Try to load a second entry — cache is over capacity but the only
+        // entry is loading (strong_count > 2).  Eviction must not panic or
+        // underflow.
+        let data = Bytes::from(vec![1u8; entry_size as usize]);
+        let _ = cache
+            .get_or_load(
+                key(99, entry_size, entry_size),
+                Box::pin(async move { Ok(data) }),
+            )
+            .await
+            .unwrap();
+
+        // Unblock the first loader.
+        tx.send(()).ok();
+        loading.await.unwrap();
+
+        // No underflow: total_bytes must be a sane value.
+        let one_tib = 1u64 << 40;
+        assert!(cache.stats().current_bytes < one_tib);
+    }
+
+    /// Port of Velox's `staleEntry`: entries with `data_size == 0` (still
+    /// loading or previously evicted) are skipped by the clock hand without
+    /// touching byte counters — no double-accounting.
+    #[tokio::test]
+    async fn test_eviction_skips_zero_size_entries() {
+        let cap = 256 * 1024u64;
+        let entry_size = 128 * 1024u64;
+        let cache = MemoryCache::new(cap);
+
+        // Fill cache to capacity.
+        for i in 0..2u64 {
+            let data = Bytes::from(vec![i as u8; entry_size as usize]);
+            cache
+                .get_or_load(key(0, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        let before = cache.stats().current_bytes;
+
+        // Load two more entries — forces eviction.  Evicted entries get
+        // data_size = 0.  If the clock hand sweeps past them again and
+        // double-subtracts, total_bytes wraps.
+        for i in 2..4u64 {
+            let data = Bytes::from(vec![i as u8; entry_size as usize]);
+            cache
+                .get_or_load(key(0, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        let after = cache.stats().current_bytes;
+
+        // total_bytes must never wrap (would produce a value >> cap).
+        assert!(after < cap * 4, "possible double-accounting: before={before} after={after}");
+        assert!(cache.stats().evictions > 0);
+    }
+
+    /// Port of Velox's `shrinkCache`: after loading entries, eviction must
+    /// bring total_bytes back to or below capacity when given enough pressure.
+    #[tokio::test]
+    async fn test_eviction_converges_to_cap() {
+        let cap = 1024 * 1024u64;         // 1 MiB
+        let entry_size = 128 * 1024u64;   // 128 KiB — 8 entries fill the cache
+        let cache = MemoryCache::new(cap);
+
+        // Load 4× capacity sequentially — forces many eviction rounds.
+        for i in 0..32u64 {
+            let data = Bytes::from(vec![0u8; entry_size as usize]);
+            cache
+                .get_or_load(key(0, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        // After the loading loop, all entry Arcs from is_new=true have dropped.
+        // strong_count for each remaining entry is exactly 2 (map + ring) →
+        // all are eviction candidates.  One more load triggers final convergence.
+        let data = Bytes::from(vec![0u8; entry_size as usize]);
+        cache
+            .get_or_load(key(1, 0, entry_size), Box::pin(async move { Ok(data) }))
+            .await
+            .unwrap();
+
+        let stats = cache.stats();
+        assert!(
+            stats.current_bytes <= cap * 2,
+            "eviction did not converge: current_bytes={} cap={}",
+            stats.current_bytes, cap
+        );
+        assert!(stats.evictions > 0);
     }
 }

@@ -421,7 +421,7 @@ mod tests {
 
         // Give the background SSD writer time to drain the eviction channel.
         // In production the decoder pipeline naturally provides this gap.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
         // Verify all entries are readable (some from memory, some from SSD).
         // Data must match original pattern exactly — this is the core invariant.

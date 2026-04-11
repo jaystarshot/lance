@@ -3,7 +3,7 @@
 
 use bytes::Bytes;
 use futures::channel::oneshot;
-use futures::{FutureExt, TryFutureExt};
+use futures::{FutureExt, TryFutureExt, future::BoxFuture};
 use object_store::path::Path;
 use std::collections::BinaryHeap;
 use std::fmt::Debug;
@@ -905,29 +905,62 @@ impl FileScheduler {
 
         async move {
             let bytes_vec: Vec<Bytes> = if let Some(cache) = data_cache {
-                // Cache path: check L1/L2 per range; only hit IoQueue on miss.
-                // On a hit the loader future is dropped without being polled —
-                // no IoTask is created, no network call is made.
-                let mut results = Vec::with_capacity(updated_requests.len());
-                for range in &updated_requests {
-                    let r = reader.clone();
-                    let rt = root.clone();
-                    let rng = range.clone();
-                    let bytes = cache
-                        .get_or_load(
-                            &path,
-                            range.start,
-                            range.end - range.start,
+                // Cache-aware path: build one future per range and drive them
+                // all concurrently via try_join_all.
+                //
+                // For cache HITS  — the future resolves immediately with no
+                // IoQueue interaction.
+                //
+                // For cache MISSES — the loader calls root.submit_request which
+                // synchronously enqueues an IoTask and returns a future.
+                // try_join_all polls every future before awaiting any result, so
+                // ALL IoTasks enter the queue before we wait for the first
+                // response — the same parallelism as the original batch path.
+                //
+                // TODO: Refactor to a proper IoScheduler trait abstraction
+                // (Option A design) so that FileScheduler has no awareness of
+                // the cache and this conditional disappears entirely:
+                //
+                //   pub trait IoScheduler: Send + Sync {
+                //       fn submit_request_boxed(...) -> BoxFuture<'static, ...>;
+                //       fn record_request(&self, ranges: &[Range<u64>]);
+                //       fn open_file_with_priority(...) -> BoxFuture<...>;
+                //   }
+                //   impl IoScheduler for ScanScheduler { ... }
+                //   impl IoScheduler for CacheAwareScheduler { ... }  // cache logic here
+                //
+                //   FileScheduler.root: Arc<dyn IoScheduler>  // was Arc<ScanScheduler>
+                //
+                // scan.rs would create a CacheAwareScheduler wrapping ScanScheduler
+                // when a data cache is configured, and pass it to open_file.
+                // FragReadConfig.scan_scheduler would change to Arc<dyn IoScheduler>.
+                let futs: Vec<BoxFuture<'static, lance_core::Result<Bytes>>> =
+                    updated_requests
+                        .iter()
+                        .map(|range| {
+                            // Move everything into the future so it is 'static.
+                            let cache = cache.clone();
+                            let path  = path.clone();
+                            let r     = reader.clone();
+                            let rt    = root.clone();
+                            let rng   = range.clone();
+                            let offset = range.start;
+                            let length = range.end - range.start;
+
+                            let loader: BoxFuture<'static, lance_core::Result<Bytes>> =
+                                Box::pin(async move {
+                                    let mut v =
+                                        rt.submit_request(r, vec![rng], priority).await?;
+                                    Ok(v.remove(0))
+                                });
+
                             Box::pin(async move {
-                                let mut v =
-                                    rt.submit_request(r, vec![rng], priority).await?;
-                                Ok(v.remove(0))
-                            }),
-                        )
-                        .await?;
-                    results.push(bytes);
-                }
-                results
+                                cache.get_or_load(&path, offset, length, loader).await
+                            }) as BoxFuture<'static, lance_core::Result<Bytes>>
+                        })
+                        .collect();
+
+                futures::future::try_join_all(futs).await?
             } else {
                 bytes_vec_fut.unwrap().await?
             };

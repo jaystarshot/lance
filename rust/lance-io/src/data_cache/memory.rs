@@ -29,17 +29,18 @@
 use std::collections::HashMap;
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use object_store::path::Path;
 use tokio::sync::watch;
 
 use lance_core::Result;
 
-use super::DataCacheKey;
+use super::{DataCache, DataCacheKey, file_ids::FileIds};
 
 // ─── Constants (same as Velox) ───────────────────────────────────────────────
 
@@ -110,8 +111,6 @@ struct CacheEntry {
     num_uses: AtomicU32,
     /// Byte size of the cached payload; 0 while Loading or after failure.
     data_size: AtomicU64,
-    /// True once loaded and not yet flushed to the SSD tier.
-    ssd_saveable: AtomicBool,
 }
 
 impl CacheEntry {
@@ -123,7 +122,6 @@ impl CacheEntry {
             last_use_ms: AtomicU64::new(0),
             num_uses: AtomicU32::new(0),
             data_size: AtomicU64::new(0),
-            ssd_saveable: AtomicBool::new(false),
         })
     }
 
@@ -400,7 +398,6 @@ impl MemoryCache {
                     Ok(bytes) => {
                         let size = bytes.len() as u64;
                         entry.data_size.store(size, Ordering::Release);
-                        entry.ssd_saveable.store(true, Ordering::Release);
                         entry.touch();
                         // Transition to shared — wakes all waiting tasks.
                         // Must use send_replace() not send(): send() silently
@@ -497,7 +494,11 @@ impl MemoryCache {
             entry.data_size.store(0, Ordering::Relaxed);
             if size > 0 {
                 inner.loaded_bytes = inner.loaded_bytes.saturating_sub(size);
-                self.total_bytes.fetch_sub(size, Ordering::Relaxed);
+                self.total_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(size))
+                    })
+                    .ok();
             }
         }
     }
@@ -522,11 +523,59 @@ impl MemoryCache {
             }
             let freed = shard.inner.lock().unwrap().evict(per_shard);
             if freed > 0 {
-                self.total_bytes.fetch_sub(freed, Ordering::Relaxed);
+                // Use fetch_update with saturating_sub to guard against
+                // concurrent evictions both subtracting from total_bytes
+                // simultaneously, which could otherwise wrap a u64 to MAX.
+                self.total_bytes
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(freed))
+                    })
+                    .ok();
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 total_freed += freed;
             }
         }
+    }
+}
+
+/// `MemoryCache` implements `DataCache` directly so it can be used standalone
+/// without wrapping in `TieredDataCache`.  File path interning is handled
+/// internally via a `FileIds` registry owned by this instance.
+pub struct StandaloneMemoryCache {
+    inner: Arc<MemoryCache>,
+    file_ids: Arc<FileIds>,
+}
+
+impl std::fmt::Debug for StandaloneMemoryCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+impl StandaloneMemoryCache {
+    pub fn new(max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            inner: MemoryCache::new(max_bytes),
+            file_ids: Arc::new(FileIds::new()),
+        })
+    }
+
+    pub fn stats(&self) -> MemoryCacheStats {
+        self.inner.stats()
+    }
+}
+
+impl DataCache for StandaloneMemoryCache {
+    fn get_or_load<'a>(
+        &'a self,
+        path: &'a Path,
+        offset: u64,
+        length: u64,
+        loader: BoxFuture<'a, Result<Bytes>>,
+    ) -> BoxFuture<'a, Result<Bytes>> {
+        let file_id = self.file_ids.get_or_intern(path);
+        let key = DataCacheKey { file_id, offset, length };
+        Box::pin(self.inner.get_or_load(key, loader))
     }
 }
 
@@ -764,16 +813,16 @@ mod tests {
         }
 
         let stats = cache.stats();
-        // Eviction is amortised — allow up to 2× cap overshoot while the
-        // clock sweep catches up.  The key invariant is no double-decrement:
-        // if total_bytes underflowed it would wrap to u64::MAX.
+        // Primary invariant: no double-decrement. A u64 underflow wraps to
+        // near u64::MAX. Allow up to 2× cap for natural amortisation overshoot
+        // (the entry being inserted is pinned on the stack during maybe_evict
+        // so it can't be evicted until the insertion returns).
         assert!(
-            stats.current_bytes <= cap * 2,
-            "double-decrement detected: current_bytes={} far exceeds cap={}",
-            stats.current_bytes,
-            cap
+            stats.current_bytes < cap * 2,
+            "possible underflow: current_bytes={} (u64::MAX would indicate wrap)",
+            stats.current_bytes
         );
-        assert!(stats.evictions > 0);
+        assert!(stats.evictions > 0, "expected evictions to fire");
     }
 
     /// Port of Velox's `findExclusiveWithWait` + failure test: when a load

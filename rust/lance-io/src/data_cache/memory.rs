@@ -254,6 +254,21 @@ impl CacheShardInner {
             // The only case where count is exactly 2 and the entry is still
             // live is when no waiter holds it and it has not yet been removed
             // from the map — the exact condition under which it is safe to evict.
+            //
+            // TODO: Velox uses an explicit `numPins_` atomic (kExclusive = -10000
+            // while loading, 0 = evictable, N = N active readers) and a RAII
+            // `CachePin` returned to callers that increments/decrements the count.
+            // This gives precise "is anyone reading this?" semantics:
+            //   https://github.com/facebookincubator/velox/blob/main/velox/common/caching/AsyncDataCache.h
+            //
+            // We deliberately omit CachePin for now because `Bytes` (Arc<[u8]>)
+            // already keeps the data alive independently of the cache index — a
+            // caller holding `Bytes` is data-safe even if the entry is evicted.
+            // The only downside is a potential cache miss on the *next* caller
+            // if we evict mid-decode, but the decode window is milliseconds and
+            // the clock-hand eviction is probabilistic, making the practical
+            // impact negligible.  Add CachePin when profiling shows eviction-
+            // mid-decode is a meaningful source of cache misses.
             if Arc::strong_count(&entry) > 2 {
                 continue; // active waiter or reader — don't evict
             }

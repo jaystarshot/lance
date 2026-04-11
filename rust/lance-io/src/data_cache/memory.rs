@@ -668,4 +668,225 @@ mod tests {
         }
         assert_eq!(count.load(Ordering::Relaxed), 3);
     }
+
+    // ── Velox-inspired tests ──────────────────────────────────────────────
+
+    /// Port of Velox's `replace` test: fill 3× capacity sequentially and verify
+    /// the cache reports hits (some entries were reused) and evictions fired.
+    #[tokio::test]
+    async fn test_replace_hits_and_evictions() {
+        let cap = 4 * 1024 * 1024u64;
+        let entry_size = 256 * 1024u64; // 256 KiB per entry
+        let num_entries = (cap / entry_size) * 3; // 3× capacity
+        let cache = MemoryCache::new(cap);
+
+        // First pass — all misses.
+        for i in 0..num_entries {
+            let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
+            cache
+                .get_or_load(
+                    key(0, i * entry_size, entry_size),
+                    Box::pin(async move { Ok(data) }),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Second pass over the same keys — should produce some hits.
+        for i in 0..num_entries {
+            let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
+            let _ = cache
+                .get_or_load(
+                    key(0, i * entry_size, entry_size),
+                    Box::pin(async move { Ok(data) }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let stats = cache.stats();
+        assert!(stats.hits > 0, "expected cache hits, got 0");
+        assert!(stats.evictions > 0, "expected evictions, got 0");
+        assert!(
+            stats.current_bytes <= cap,
+            "cache exceeded capacity: {} > {}",
+            stats.current_bytes,
+            cap
+        );
+    }
+
+    /// Port of Velox's `staleEntry` / double-eviction test: verify that
+    /// `total_bytes` and per-shard `loaded_bytes` stay consistent after many
+    /// evictions.  A double-decrement bug would make `total_bytes` underflow
+    /// causing `maybe_evict` to stop triggering.
+    #[tokio::test]
+    async fn test_accounting_invariant_under_eviction() {
+        let cap = 2 * 1024 * 1024u64;
+        let entry_size = 128 * 1024u64;
+        // Load 8× capacity to force many evictions.
+        let num_entries = (cap / entry_size) * 8;
+        let cache = Arc::new(MemoryCache::new(cap));
+
+        for i in 0..num_entries {
+            let data = Bytes::from(vec![0u8; entry_size as usize]);
+            cache
+                .get_or_load(
+                    key(1, i * entry_size, entry_size),
+                    Box::pin(async move { Ok(data) }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let stats = cache.stats();
+        // The cache must never exceed its declared capacity.
+        assert!(
+            stats.current_bytes <= cap,
+            "double-decrement detected: current_bytes={} exceeds cap={}",
+            stats.current_bytes,
+            cap
+        );
+        // Eviction must have fired.
+        assert!(stats.evictions > 0);
+        // total misses == num_entries (each key loaded exactly once).
+        assert_eq!(stats.misses, num_entries);
+    }
+
+    /// Port of Velox's `findExclusiveWithWait` + failure test: when a load
+    /// fails, *all* concurrent waiters must be unblocked and the entry must be
+    /// removed so the next caller can retry successfully.
+    #[tokio::test]
+    async fn test_concurrent_waiters_see_failure_and_retry() {
+        let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
+        let k = key(5, 0, 4);
+        let load_count = Arc::new(AtomicUsize::new(0));
+
+        // Spawn 8 concurrent tasks all requesting the same key.
+        // The first will fail; the rest wait, see Failed, and retry.
+        // On retry (second round of find_or_create), one becomes new owner
+        // and succeeds.
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+
+        for i in 0..8usize {
+            let cache = cache.clone();
+            let k = k.clone();
+            let lc = load_count.clone();
+            let bar = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                bar.wait().await; // all tasks start simultaneously
+                let attempt = i;
+                cache
+                    .get_or_load(
+                        k,
+                        Box::pin(async move {
+                            lc.fetch_add(1, Ordering::Relaxed);
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            if attempt == 0 {
+                                // First task fails.
+                                Err(lance_core::Error::io("injected failure".to_string()))
+                            } else {
+                                Ok(Bytes::from_static(b"ok"))
+                            }
+                        }),
+                    )
+                    .await
+            }));
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|h| h.unwrap())
+            .collect();
+
+        // Exactly one task returned an error (the first loader).
+        let errors = results.iter().filter(|r| r.is_err()).count();
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(errors, 1, "expected exactly 1 error from the failing loader");
+        assert_eq!(successes, 7);
+
+        // After the failure, a fresh load should succeed.
+        let bytes = cache
+            .get_or_load(k, Box::pin(async { Ok(Bytes::from_static(b"fresh")) }))
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"fresh"));
+    }
+
+    /// Port of Velox's `fuzz` test: 8 concurrent tasks randomly reading
+    /// different (file_id, offset) pairs for 500ms, verifying the cache
+    /// never deadlocks, never panics, and never exceeds capacity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_fuzz_concurrent_access() {
+        use rand::Rng;
+
+        let cap = 8 * 1024 * 1024u64;
+        let entry_size = 64 * 1024u64; // 64 KiB
+        let num_files = 5u64;
+        let offsets_per_file = 20u64;
+        let cache = Arc::new(MemoryCache::new(cap));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+
+        let mut handles = Vec::new();
+        for _worker in 0..8 {
+            let cache = cache.clone();
+            handles.push(tokio::spawn(async move {
+                use rand::{SeedableRng, rngs::SmallRng};
+                let mut rng = SmallRng::from_os_rng();
+                while std::time::Instant::now() < deadline {
+                    let file_id = rng.gen_range(0..num_files);
+                    let offset_idx = rng.gen_range(0..offsets_per_file);
+                    let offset = offset_idx * entry_size;
+                    let k = key(file_id, offset, entry_size);
+
+                    let data =
+                        Bytes::from(vec![(file_id ^ offset_idx) as u8; entry_size as usize]);
+                    let _ = cache
+                        .get_or_load(k, Box::pin(async move { Ok(data) }))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let stats = cache.stats();
+        assert!(stats.hits > 0, "expected hits in fuzz run");
+        assert!(stats.misses > 0, "expected misses in fuzz run");
+        assert!(
+            stats.current_bytes <= cap,
+            "cache exceeded capacity during fuzz: {} > {}",
+            stats.current_bytes,
+            cap
+        );
+    }
+
+    /// Stats accounting: hits + misses == total requests (for single-key scenario).
+    #[tokio::test]
+    async fn test_stats_accounting() {
+        let cache = MemoryCache::new(10 * 1024 * 1024);
+        let k = key(6, 0, 4);
+        let requests = 10usize;
+
+        for _ in 0..requests {
+            cache
+                .get_or_load(k.clone(), Box::pin(async { Ok(Bytes::from_static(b"x")) }))
+                .await
+                .unwrap();
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 1, "only first request should miss");
+        assert_eq!(
+            stats.hits,
+            (requests - 1) as u64,
+            "remaining requests should hit"
+        );
+        assert_eq!(stats.current_bytes, 1); // "x" = 1 byte
+    }
 }

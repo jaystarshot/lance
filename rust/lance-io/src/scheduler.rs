@@ -883,15 +883,54 @@ impl FileScheduler {
 
         self.root.stats.record_request(&updated_requests);
 
-        let bytes_vec_fut =
-            self.root
-                .submit_request(self.reader.clone(), updated_requests.clone(), priority);
+        // For the no-cache path pre-queue all IoTasks synchronously — this
+        // preserves the existing behaviour where tasks enter the IoQueue before
+        // any `.await`, allowing multiple files to queue reads concurrently.
+        let data_cache = self.root.data_cache.clone();
+        let bytes_vec_fut = if data_cache.is_none() {
+            Some(
+                self.root
+                    .submit_request(self.reader.clone(), updated_requests.clone(), priority),
+            )
+        } else {
+            None
+        };
+
+        let reader = self.reader.clone();
+        let root = self.root.clone();
+        let path = self.reader.path().clone();
 
         let mut updated_index = 0;
         let mut final_bytes = Vec::with_capacity(request.len());
 
         async move {
-            let bytes_vec = bytes_vec_fut.await?;
+            let bytes_vec: Vec<Bytes> = if let Some(cache) = data_cache {
+                // Cache path: check L1/L2 per range; only hit IoQueue on miss.
+                // On a hit the loader future is dropped without being polled —
+                // no IoTask is created, no network call is made.
+                let mut results = Vec::with_capacity(updated_requests.len());
+                for range in &updated_requests {
+                    let r = reader.clone();
+                    let rt = root.clone();
+                    let rng = range.clone();
+                    let bytes = cache
+                        .get_or_load(
+                            &path,
+                            range.start,
+                            range.end - range.start,
+                            Box::pin(async move {
+                                let mut v =
+                                    rt.submit_request(r, vec![rng], priority).await?;
+                                Ok(v.remove(0))
+                            }),
+                        )
+                        .await?;
+                    results.push(bytes);
+                }
+                results
+            } else {
+                bytes_vec_fut.unwrap().await?
+            };
 
             let mut orig_index = 0;
             while (updated_index < updated_requests.len()) && (orig_index < request.len()) {

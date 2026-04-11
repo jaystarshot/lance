@@ -13,7 +13,7 @@ use futures::FutureExt;
 use lance_core::utils::tracing::{DATASET_LOADING_EVENT, TRACE_DATASET_EVENTS};
 use lance_file::datatypes::populate_schema_dictionary;
 use lance_file::reader::FileReaderOptions;
-use lance_io::data_cache::DataCacheConfig;
+use lance_io::data_cache::{DataCacheConfig, TieredDataCache};
 use lance_io::object_store::{
     DEFAULT_CLOUD_IO_PARALLELISM, LanceNamespaceStorageOptionsProvider, ObjectStore,
     ObjectStoreParams, StorageOptions, StorageOptionsAccessor,
@@ -619,11 +619,11 @@ impl DatasetBuilder {
                     ),
                 };
                 // Attach data cache when configured.
-                // TODO: replace with real MemoryDataCache::new(&cfg) once the
-                // memory and SSD tier implementations are built.
                 let s = if let Some(cfg) = data_cache_config {
-                    let _ = cfg; // config parsed and validated; cache wired in next PR
-                    s
+                    let data_cache = TieredDataCache::new(&cfg).await.map_err(|e| {
+                        Error::invalid_input(format!("failed to initialise data cache: {e}"))
+                    })?;
+                    s.with_data_cache(data_cache)
                 } else {
                     s
                 };

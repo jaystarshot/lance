@@ -398,8 +398,12 @@ impl MemoryCache {
                         entry.ssd_saveable.store(true, Ordering::Release);
                         entry.touch();
                         // Transition to shared — wakes all waiting tasks.
-                        // Equivalent to Velox's setExclusiveToShared().
-                        entry.state_tx.send(LoadState::Loaded(bytes.clone())).ok();
+                        // Must use send_replace() not send(): send() silently
+                        // drops the value when there are no active receivers
+                        // (the initial _rx was dropped in CacheEntry::new),
+                        // leaving the channel stuck at Loading so any waiter
+                        // that subscribes later hangs forever on changed().await.
+                        entry.state_tx.send_replace(LoadState::Loaded(bytes.clone()));
                         // Update both counters under the shard lock so that a
                         // concurrent eviction always sees a consistent view of
                         // loaded_bytes and total_bytes for this shard.
@@ -416,7 +420,7 @@ impl MemoryCache {
                         // Load failed — signal waiters, remove entry so the
                         // next caller gets a fresh miss.  Equivalent to Velox's
                         // `CachePin::release()` on an exclusive pin.
-                        entry.state_tx.send(LoadState::Failed).ok();
+                        entry.state_tx.send_replace(LoadState::Failed);
                         self.remove_entry(&key);
                         return Err(e);
                     }
@@ -836,8 +840,8 @@ mod tests {
                 use rand::{SeedableRng, rngs::SmallRng};
                 let mut rng = SmallRng::from_os_rng();
                 while std::time::Instant::now() < deadline {
-                    let file_id = rng.gen_range(0..num_files);
-                    let offset_idx = rng.gen_range(0..offsets_per_file);
+                    let file_id = rng.random_range(0..num_files);
+                    let offset_idx = rng.random_range(0..offsets_per_file);
                     let offset = offset_idx * entry_size;
                     let k = key(file_id, offset, entry_size);
 

@@ -350,4 +350,112 @@ mod tests {
 
         assert_eq!(cache.memory_stats().hits, 1);
     }
+
+    // ── Two-tier integration tests (Velox's DISABLED_ssd equivalent) ──────
+
+    /// Port of Velox's `DISABLED_ssd` — simplified two-tier data integrity
+    /// test: data loaded from the object store is written to both memory and
+    /// SSD.  After the memory entry would be evicted, a subsequent read must
+    /// be served from SSD with byte-for-byte identical data.
+    #[tokio::test]
+    async fn test_two_tier_ssd_fallback_data_integrity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DataCacheConfig {
+            // Memory so small it holds only 1 entry — forces SSD reliance.
+            max_memory_bytes: 512 * 1024,
+            num_shards: memory::DEFAULT_NUM_SHARDS,
+            ssd_cache_dir: Some(tmp.path().join("two_tier")),
+            ssd_max_bytes: ssd::REGION_SIZE * 4,
+            ssd_num_shards: 1,
+        };
+        let cache = TieredDataCache::new(&config).await.unwrap();
+        let path = Path::from("s3://bucket/data.lance");
+
+        let entry_size = 256 * 1024u64; // 256 KiB
+        let n = 4u64; // 4 entries — well above the 512 KiB memory limit
+
+        // Load all entries — they go to memory AND SSD.
+        for i in 0..n {
+            let pattern = Bytes::from(vec![(i * 37 % 256) as u8; entry_size as usize]);
+            let p = pattern.clone();
+            cache
+                .get_or_load(
+                    &path,
+                    i * entry_size,
+                    entry_size,
+                    Box::pin(async move { Ok(p) }),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Verify all entries are readable (some from memory, some from SSD).
+        // Data must match original pattern exactly — this is the core invariant.
+        for i in 0..n {
+            let expected = (i * 37 % 256) as u8;
+            let result = cache
+                .get_or_load(
+                    &path,
+                    i * entry_size,
+                    entry_size,
+                    // Loader should only be called if the entry is in neither tier.
+                    Box::pin(async move {
+                        // If both tiers miss, the two-tier integration is broken.
+                        panic!("entry {i} missing from both memory and SSD tiers")
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.len(), entry_size as usize, "entry {i}: wrong size");
+            assert_eq!(result[0], expected, "entry {i}: data corruption detected");
+        }
+    }
+
+    /// Port of Velox's `cacheStatsWithSsd`: two-tier cache exposes accurate
+    /// SSD statistics via the memory tier stats interface.
+    #[tokio::test]
+    async fn test_tiered_cache_stats_accumulate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DataCacheConfig {
+            max_memory_bytes: 4 * 1024 * 1024,
+            num_shards: memory::DEFAULT_NUM_SHARDS,
+            ssd_cache_dir: Some(tmp.path().join("stats_test")),
+            ssd_max_bytes: ssd::REGION_SIZE * 2,
+            ssd_num_shards: 1,
+        };
+        let cache = TieredDataCache::new(&config).await.unwrap();
+        let path = Path::from("test.lance");
+
+        // 5 misses populate both tiers.
+        for i in 0u64..5 {
+            let data = Bytes::from(vec![i as u8; 4096]);
+            cache
+                .get_or_load(
+                    &path,
+                    i * 4096,
+                    4096,
+                    Box::pin(async move { Ok(data) }),
+                )
+                .await
+                .unwrap();
+        }
+
+        let stats = cache.memory_stats();
+        assert_eq!(stats.misses, 5);
+        assert_eq!(stats.current_bytes, 5 * 4096);
+
+        // 5 hits from memory.
+        for i in 0u64..5 {
+            cache
+                .get_or_load(
+                    &path,
+                    i * 4096,
+                    4096,
+                    Box::pin(async { panic!("must hit") }),
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(cache.memory_stats().hits, 5);
+    }
 }

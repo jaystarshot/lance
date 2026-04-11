@@ -31,8 +31,7 @@
 //! # On restart
 //!
 //! The cache directory is wiped on startup (no checkpoint/recovery).  This
-//! keeps the implementation simple — Lance datasets are immutable and versioned,
-//! so stale cache data is never a correctness concern.
+//! keeps the implementation simple 
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1102,5 +1101,266 @@ mod tests {
             size: 4096,
         };
         assert_eq!(run.file_offset(), 2 * REGION_SIZE + 1024);
+    }
+
+    // ── Tests not ported from Velox (with explanation) ────────────────────
+    //
+    // DISABLED_ssd (checkpoint recovery): Velox's ssd test verifies that a
+    //   corrupted shard file is detected and skipped during checkpoint reload.
+    //   We wipe the directory on restart with no recovery — not applicable.
+    //
+    // shutdown (eviction log): Velox tracks an eviction log file per shard
+    //   that is truncated on shutdown.  We have no eviction log — not applicable.
+    //
+    // shrinkWithSsdWrite: Requires SCOPED_TESTVALUE_SET hooks to pause the
+    //   background SSD write at a specific code point.  Not portable.
+    //
+    // ssdWriteOptions / ssdFlushThresholdBytes: Test configurable thresholds
+    //   for when to flush saveable entries to SSD (maxWriteRatio,
+    //   ssdSavableRatio, minSsdSavableBytes).  We flush eagerly on every
+    //   insert — these knobs are not implemented.
+    //
+    // appendSsdSaveable (partial): Velox's appendAll flag controls whether
+    //   saveToSsd() saves all saveable entries or just one per shard.  Our
+    //   insert_many() always writes all provided entries — equivalent to
+    //   appendAll=true.  The appendAll=false variant is not applicable.
+    //
+    // checkpoint: We do not implement checkpoint/recovery.
+    //
+    // makeEvictable: Tests explicit numPins / CachePin marking for SSD save.
+    //   Not implemented (see memory.rs TODO comment).
+    //
+    // ttl: CacheTTLController — not applicable for immutable Lance datasets.
+
+    // ── Additional Velox-inspired SSD tests ───────────────────────────────
+
+    /// Port of Velox's `cacheStats` (SSD portion): verify that bytes_written,
+    /// bytes_read, entries_written, entries_read are all accurate.
+    #[tokio::test]
+    async fn test_ssd_cache_stats() {
+        let cache = make_cache(REGION_SIZE * 4, 1).await;
+        let entry_size = 8 * 1024u64; // 8 KiB
+        let n = 10u64;
+
+        // Write n entries.
+        for i in 0..n {
+            let data = Bytes::from(vec![i as u8; entry_size as usize]);
+            cache.insert(key(0, i * entry_size, entry_size), data).await;
+        }
+
+        let after_write = cache.stats();
+        assert_eq!(after_write.entries_written, n);
+        assert_eq!(after_write.bytes_written, n * entry_size);
+        assert_eq!(after_write.entries_read, 0);
+        assert_eq!(after_write.bytes_read, 0);
+
+        // Read all n entries back.
+        for i in 0..n {
+            let result = cache.get(&key(0, i * entry_size, entry_size)).await;
+            assert!(result.is_some(), "entry {i} missing");
+        }
+
+        let after_read = cache.stats();
+        assert_eq!(after_read.entries_written, n);
+        assert_eq!(after_read.entries_read, n);
+        assert_eq!(after_read.bytes_read, n * entry_size);
+    }
+
+    /// Port of Velox's `cacheStatsWithSsd` (delta stats): subtracting stats
+    /// snapshots must give accurate deltas for the intervening operations.
+    #[tokio::test]
+    async fn test_ssd_stats_delta() {
+        let cache = make_cache(REGION_SIZE * 4, 1).await;
+        let data = Bytes::from(vec![42u8; 4096]);
+        let k = key(0, 0, 4096);
+
+        let before = cache.stats();
+
+        cache.insert(k.clone(), data).await;
+        let _ = cache.get(&k).await;
+
+        let after = cache.stats();
+
+        // Delta: exactly 1 write and 1 read.
+        assert_eq!(after.entries_written - before.entries_written, 1);
+        assert_eq!(after.entries_read - before.entries_read, 1);
+        assert_eq!(after.bytes_written - before.bytes_written, 4096);
+        assert_eq!(after.bytes_read - before.bytes_read, 4096);
+    }
+
+    /// Port of Velox's `invalidSsdPath`: creating a cache in an invalid
+    /// or non-writable location must fail gracefully.
+    #[tokio::test]
+    async fn test_invalid_ssd_path_fails() {
+        // A file path (not a directory) cannot be used as a cache directory.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let bad_path = tmp.path().join("cannot_create_dir_inside_file");
+        let config = SsdCacheConfig {
+            cache_dir: bad_path,
+            max_bytes: REGION_SIZE * 2,
+            num_shards: 1,
+        };
+        let result = SsdCache::new(config).await;
+        assert!(result.is_err(), "expected error for invalid SSD path");
+    }
+
+    /// Port of Velox's `DISABLED_ssd` data-integrity check: bytes written to
+    /// the SSD tier must be read back byte-for-byte identically.  This is the
+    /// core correctness guarantee of the SSD cache.
+    #[tokio::test]
+    async fn test_data_integrity_write_then_read() {
+        let cache = make_cache(REGION_SIZE * 4, 1).await;
+
+        // Write entries with recognisable per-entry byte patterns.
+        let entry_size = 16 * 1024u64; // 16 KiB
+        let n = 20u64;
+
+        for i in 0..n {
+            // Pattern: repeating (i % 256) so we can verify each byte.
+            let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
+            cache.insert(key(0, i * entry_size, entry_size), data).await;
+        }
+
+        // Read back and verify every byte.
+        for i in 0..n {
+            let result = cache.get(&key(0, i * entry_size, entry_size)).await;
+            let bytes = result.unwrap_or_else(|| panic!("entry {i} not found"));
+            assert_eq!(
+                bytes.len(),
+                entry_size as usize,
+                "entry {i}: wrong length"
+            );
+            for (j, &b) in bytes.iter().enumerate() {
+                assert_eq!(
+                    b,
+                    (i % 256) as u8,
+                    "entry {i} byte {j}: got {b} expected {}",
+                    i % 256
+                );
+            }
+        }
+    }
+
+    /// Port of Velox's `appendSsdSaveable` (appendAll=true path): insert_many
+    /// writes all provided entries and all are readable — equivalent to Velox's
+    /// saveToSsd(appendAll=true) followed by reads.
+    #[tokio::test]
+    async fn test_insert_many_all_entries_written_and_readable() {
+        let cache = make_cache(REGION_SIZE * 4, 1).await;
+        let entry_size = 4096u64;
+        let n = 50u64;
+
+        let entries: Vec<(DataCacheKey, Bytes)> = (0..n)
+            .map(|i| {
+                let pattern = vec![(i % 256) as u8; entry_size as usize];
+                (key(0, i * entry_size, entry_size), Bytes::from(pattern))
+            })
+            .collect();
+
+        cache.insert_many(entries).await;
+
+        let stats = cache.stats();
+        assert_eq!(stats.entries_written, n, "all entries must be written");
+
+        // All entries must be readable with correct data.
+        for i in 0..n {
+            let result = cache.get(&key(0, i * entry_size, entry_size)).await;
+            let bytes = result.unwrap_or_else(|| panic!("entry {i} missing after insert_many"));
+            assert_eq!(bytes[0], (i % 256) as u8, "entry {i}: wrong data");
+        }
+    }
+
+    /// Port of Velox's `dataRanges` data-integrity variant: bytes stored and
+    /// retrieved must match exactly, regardless of size (small or large entries).
+    #[tokio::test]
+    async fn test_data_ranges_small_and_large() {
+        let cache = make_cache(REGION_SIZE * 4, 1).await;
+
+        // Small entries (< 10 KiB — triggers 25 KB coalesce gap).
+        let small_size = 2048u64;
+        for i in 0u64..8 {
+            let data = Bytes::from(vec![(i * 17 % 256) as u8; small_size as usize]);
+            cache.insert(key(1, i * small_size, small_size), data).await;
+        }
+        for i in 0u64..8 {
+            let result = cache.get(&key(1, i * small_size, small_size)).await.unwrap();
+            assert_eq!(result[0], (i * 17 % 256) as u8, "small entry {i}");
+        }
+
+        // Large entries (> 10 KiB — triggers 50 KB coalesce gap).
+        let large_size = 128 * 1024u64;
+        for i in 0u64..4 {
+            let data = Bytes::from(vec![(i * 31 % 256) as u8; large_size as usize]);
+            cache.insert(key(2, i * large_size, large_size), data).await;
+        }
+        for i in 0u64..4 {
+            let result = cache.get(&key(2, i * large_size, large_size)).await.unwrap();
+            assert_eq!(result[0], (i * 31 % 256) as u8, "large entry {i}");
+            assert_eq!(result.len(), large_size as usize);
+        }
+    }
+
+    /// Oversized entries (> REGION_SIZE) must be silently dropped — not
+    /// written and not found on subsequent reads.
+    #[tokio::test]
+    async fn test_oversized_entry_silently_skipped() {
+        let cache = make_cache(REGION_SIZE * 2, 1).await;
+        let big = Bytes::from(vec![0u8; REGION_SIZE as usize + 1]);
+        let k = key(0, 0, REGION_SIZE + 1);
+
+        cache.insert(k.clone(), big).await;
+
+        // No write should have occurred.
+        assert_eq!(cache.stats().entries_written, 0);
+        assert!(cache.get(&k).await.is_none());
+    }
+
+    /// Concurrent inserts and gets on the same cache must not corrupt data —
+    /// equivalent to Velox's `fuzz` test for the SSD tier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_inserts_and_gets() {
+        let cache = Arc::new(make_cache(REGION_SIZE * 8, 4).await);
+        let entry_size = 4096u64;
+        let n = 64u64;
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(300);
+
+        // Writers: insert entries with known patterns.
+        let cache_w = cache.clone();
+        let writer = tokio::spawn(async move {
+            while std::time::Instant::now() < deadline {
+                for i in 0..n {
+                    let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
+                    cache_w.insert(key(0, i * entry_size, entry_size), data).await;
+                }
+            }
+        });
+
+        // Readers: read entries and verify data integrity on hits.
+        let cache_r = cache.clone();
+        let reader = tokio::spawn(async move {
+            while std::time::Instant::now() < deadline {
+                for i in 0..n {
+                    if let Some(bytes) = cache_r.get(&key(0, i * entry_size, entry_size)).await {
+                        // Verify data integrity: all bytes should match the pattern.
+                        assert_eq!(
+                            bytes.len(),
+                            entry_size as usize,
+                            "entry {i}: wrong length"
+                        );
+                        let expected = (i % 256) as u8;
+                        for (j, &b) in bytes.iter().enumerate() {
+                            assert_eq!(b, expected, "entry {i} byte {j} corrupted");
+                        }
+                    }
+                }
+            }
+        });
+
+        writer.await.unwrap();
+        reader.await.unwrap();
+
+        let stats = cache.stats();
+        assert!(stats.entries_written > 0);
     }
 }

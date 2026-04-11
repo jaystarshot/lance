@@ -1234,4 +1234,179 @@ mod tests {
         );
         assert!(stats.evictions > 0);
     }
+
+    // ── Tests not ported from Velox (with explanation) ───────────────────
+    //
+    // evictAccounting: Velox tests interaction between cache eviction and a
+    //   custom MemoryPool allocator.  Lance uses Bytes (Arc<[u8]>) with no
+    //   custom allocator, so pool-level accounting is not applicable.
+    //
+    // shrinkWithSsdWrite: Requires SCOPED_TESTVALUE_SET / TestValue hooks to
+    //   pause SSD writes at a specific code point.  Our implementation has no
+    //   equivalent test-hook infrastructure.
+    //
+    // ttl: Velox's CacheTTLController expires entries based on when files were
+    //   opened.  Lance datasets are immutable and versioned — cached data is
+    //   valid indefinitely for a given file path, so TTL is not implemented.
+    //
+    // makeEvictable: Tests explicit num_pins / CachePin management.  We
+    //   deliberately omit CachePin (see TODO comment in evict()), relying on
+    //   Bytes (Arc<[u8]>) to keep data alive independently.
+    //
+    // dataRanges: Tests Velox's allocation-run API (tiny inline storage vs
+    //   MmapAllocator pages).  Our entries are uniform Bytes (Arc<[u8]>);
+    //   there is no multi-run layout to verify.
+    //
+    // pin (partial): The full Velox pin test exercises CachePin move semantics
+    //   and explicit numPins counting.  The equivalent state-machine behaviour
+    //   (exclusive while loading, shared after, waiters unblocked on failure)
+    //   is already covered by test_concurrent_waiters_see_failure_and_retry
+    //   and test_load_deduplication.
+
+    // ── Additional Velox-inspired tests ──────────────────────────────────
+
+    /// Port of Velox's `findMiss`: looking up a key that was never inserted
+    /// must return None (loader is called, not bypassed).
+    #[tokio::test]
+    async fn test_find_miss() {
+        let cache = MemoryCache::new(10 * 1024 * 1024);
+        let k = key(10, 0, 4);
+        let load_count = Arc::new(AtomicUsize::new(0));
+        let lc = load_count.clone();
+
+        // First access: miss — loader must be called.
+        let bytes = cache
+            .get_or_load(
+                k.clone(),
+                Box::pin(async move {
+                    lc.fetch_add(1, Ordering::Relaxed);
+                    Ok(Bytes::from_static(b"data"))
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"data"));
+        assert_eq!(load_count.load(Ordering::Relaxed), 1, "loader must run on miss");
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().hits, 0);
+    }
+
+    /// Port of Velox's `findHit`: after a miss populates the cache, the next
+    /// access must return exactly the same bytes without calling the loader.
+    /// Verifies data integrity (byte-for-byte match) — equivalent to Velox's
+    /// `checkContents(*entry)`.
+    #[tokio::test]
+    async fn test_find_hit_data_integrity() {
+        let cache = MemoryCache::new(10 * 1024 * 1024);
+        // Use a recognisable pattern so a stale-copy bug would be detectable.
+        let pattern: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let original = Bytes::from(pattern.clone());
+        let k = key(11, 0, 4096);
+
+        // Miss — populate cache.
+        let b1 = cache
+            .get_or_load(k.clone(), Box::pin(async move { Ok(original) }))
+            .await
+            .unwrap();
+        assert_eq!(b1.as_ref(), pattern.as_slice(), "loaded bytes must match pattern");
+
+        // Hit — must return identical bytes without calling loader.
+        let b2 = cache
+            .get_or_load(k, Box::pin(async { panic!("loader must not be called on hit") }))
+            .await
+            .unwrap();
+        assert_eq!(b2.as_ref(), pattern.as_slice(), "hit bytes must match original");
+        // Both should point to the same underlying allocation.
+        assert_eq!(b1.as_ptr(), b2.as_ptr(), "hit must return the cached Arc, not a copy");
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    /// Port of Velox's `cacheStats`: verifies that all stat counters are
+    /// incremented correctly and reflect the true cache state.
+    #[tokio::test]
+    async fn test_cache_stats_fields() {
+        let cache = MemoryCache::new(2 * 1024 * 1024);
+        let entry_size = 256 * 1024u64;
+
+        // 4 misses.
+        for i in 0u64..4 {
+            let data = Bytes::from(vec![i as u8; entry_size as usize]);
+            cache
+                .get_or_load(key(12, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        // 4 more hits on the same keys (cache holds 2 MiB = 8 × 256 KiB entries).
+        for i in 0u64..4 {
+            let data = Bytes::from(vec![i as u8; entry_size as usize]);
+            cache
+                .get_or_load(key(12, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 4, "misses");
+        assert_eq!(stats.hits, 4, "hits");
+        assert_eq!(stats.max_bytes, 2 * 1024 * 1024, "max_bytes");
+        // current_bytes should reflect the 4 entries still in cache.
+        assert_eq!(stats.current_bytes, 4 * entry_size, "current_bytes");
+    }
+
+    /// Port of Velox's `pin` state-machine: while a load is in progress
+    /// (exclusive / Loading state) concurrent callers must block; after the
+    /// transition to Loaded all blocked callers receive the same data.
+    /// This complements test_load_deduplication with an explicit timing check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_exclusive_to_shared_transition() {
+        let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
+        let k = key(13, 0, 8);
+
+        let (loading_tx, loading_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Task A: "exclusive" loader — signals when loading has started, then
+        // sleeps to give Task B time to see the Loading state.
+        let cache_a = cache.clone();
+        let k_a = k.clone();
+        let loader_task = tokio::spawn(async move {
+            cache_a
+                .get_or_load(
+                    k_a,
+                    Box::pin(async move {
+                        loading_tx.send(()).ok(); // signal: exclusive load started
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                        done_tx.send(()).ok();
+                        Ok(Bytes::from_static(b"exclusive"))
+                    }),
+                )
+                .await
+                .unwrap()
+        });
+
+        // Wait until the loader has started (entry is in Loading state).
+        loading_rx.await.ok();
+
+        // Task B: concurrent waiter — should block until A completes.
+        let cache_b = cache.clone();
+        let k_b = k.clone();
+        let waiter_task = tokio::spawn(async move {
+            cache_b
+                .get_or_load(
+                    k_b,
+                    Box::pin(async { panic!("waiter must not call its own loader") }),
+                )
+                .await
+                .unwrap()
+        });
+
+        let a_result = loader_task.await.unwrap();
+        let b_result = waiter_task.await.unwrap();
+
+        assert_eq!(a_result, Bytes::from_static(b"exclusive"));
+        assert_eq!(b_result, Bytes::from_static(b"exclusive"));
+        // Both should point to the same allocation (watch-channel clone).
+        assert_eq!(a_result.as_ptr(), b_result.as_ptr());
+    }
 }

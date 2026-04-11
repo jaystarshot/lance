@@ -82,6 +82,12 @@ pub struct DataCacheConfig {
     /// Default: 256 MiB when not specified but another cache option is set.
     pub max_memory_bytes: u64,
 
+    /// Number of independent memory-tier shards.  Must be a power of two.
+    /// Higher values reduce mutex contention on many-core machines at the cost
+    /// of slightly more memory overhead.  Defaults to [`DEFAULT_NUM_SHARDS`]
+    /// (16) — the same default as Velox's `AsyncDataCache`.
+    pub num_shards: usize,
+
     /// Directory on a local SSD for the on-disk (L2) cache tier.
     /// When `None`, only the memory tier is active.
     pub ssd_cache_dir: Option<PathBuf>,
@@ -93,6 +99,7 @@ pub struct DataCacheConfig {
 
 impl DataCacheConfig {
     pub const KEY_MAX_MEMORY_MB: &'static str = "max_memory_cache_mb";
+    pub const KEY_NUM_SHARDS: &'static str = "memory_cache_num_shards";
     pub const KEY_SSD_CACHE_DIR: &'static str = "ssd_cache_dir";
     pub const KEY_SSD_CACHE_SIZE_MB: &'static str = "ssd_cache_size_mb";
 
@@ -119,8 +126,14 @@ impl DataCacheConfig {
             return None;
         }
 
+        let num_shards = opts
+            .get(Self::KEY_NUM_SHARDS)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(memory::DEFAULT_NUM_SHARDS);
+
         Some(Self {
             max_memory_bytes: max_memory_bytes.unwrap_or(256 * 1024 * 1024),
+            num_shards,
             ssd_cache_dir,
             ssd_max_bytes,
         })
@@ -189,7 +202,7 @@ impl TieredDataCache {
     ///
     /// Creates the SSD tier and cleans its directory if `ssd_cache_dir` is set.
     pub async fn new(config: &DataCacheConfig) -> Result<Arc<Self>> {
-        let memory = MemoryCache::new(config.max_memory_bytes);
+        let memory = MemoryCache::new_with_shards(config.max_memory_bytes, config.num_shards);
 
         let ssd = if let Some(dir) = &config.ssd_cache_dir {
             let ssd_config = SsdCacheConfig {
@@ -293,6 +306,7 @@ mod tests {
     async fn test_tiered_cache_memory_hit() {
         let config = DataCacheConfig {
             max_memory_bytes: 10 * 1024 * 1024,
+            num_shards: memory::DEFAULT_NUM_SHARDS,
             ssd_cache_dir: None,
             ssd_max_bytes: 0,
         };

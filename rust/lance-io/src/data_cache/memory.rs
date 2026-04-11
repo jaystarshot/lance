@@ -44,9 +44,9 @@ use super::{DataCache, DataCacheKey, file_ids::FileIds};
 
 // ─── Constants (same as Velox) ───────────────────────────────────────────────
 
-/// Number of independent shards.  Must be a power of two.
-const NUM_SHARDS: usize = 16;
-const SHARD_MASK: u64 = (NUM_SHARDS as u64) - 1;
+/// Default number of independent shards — must be a power of two.
+/// Matches Velox's `AsyncDataCache::kDefaultNumShards`.
+pub const DEFAULT_NUM_SHARDS: usize = 16;
 
 /// Number of entries sampled when calibrating the eviction threshold.
 const NUM_EVICTION_SAMPLES: usize = 10;
@@ -75,13 +75,13 @@ fn now_ms() -> u64 {
 // ─── Shard selection ─────────────────────────────────────────────────────────
 
 #[inline]
-fn shard_idx(key: &DataCacheKey) -> usize {
+fn shard_idx(key: &DataCacheKey, shard_mask: u64) -> usize {
     // Fibonacci hashing — mixes file_id and offset uniformly across shards.
     let h = key
         .file_id
         .wrapping_mul(11_400_714_819_323_198_485_u64)
         .wrapping_add(key.offset.wrapping_mul(6_364_136_223_846_793_005_u64));
-    (h & SHARD_MASK) as usize
+    (h & shard_mask) as usize
 }
 
 // ─── Entry ───────────────────────────────────────────────────────────────────
@@ -337,7 +337,8 @@ pub struct MemoryCacheStats {
 
 /// Sharded in-memory cache with Velox-style clock-hand + percentile eviction.
 ///
-/// The cache is logically split into `NUM_SHARDS` (16) independent shards.
+/// The cache is logically split into `num_shards` independent shards (default
+/// [`DEFAULT_NUM_SHARDS`] = 16, same as Velox's `kDefaultNumShards`).
 /// Each shard owns its hash-map and eviction ring and is protected by its own
 /// `std::sync::Mutex`, so concurrent tasks hitting different files (or
 /// different offsets within the same file) almost never contend.
@@ -347,6 +348,9 @@ pub struct MemoryCacheStats {
 /// blocked while waiting.
 pub struct MemoryCache {
     shards: Vec<CacheShard>,
+    /// Bit-mask for fast shard selection: `hash & shard_mask`.
+    /// Always `num_shards - 1` since num_shards is a power of two.
+    shard_mask: u64,
     /// Hard upper bound on total cached bytes across all shards.
     max_bytes: u64,
     /// Running total of loaded bytes (updated atomically outside shard locks).
@@ -366,10 +370,29 @@ impl std::fmt::Debug for MemoryCache {
 }
 
 impl MemoryCache {
+    /// Create a new cache with the default shard count ([`DEFAULT_NUM_SHARDS`]).
     pub fn new(max_bytes: u64) -> Arc<Self> {
-        let shards = (0..NUM_SHARDS).map(|_| CacheShard::new()).collect();
+        Self::new_with_shards(max_bytes, DEFAULT_NUM_SHARDS)
+    }
+
+    /// Create a new cache with a custom shard count.
+    ///
+    /// `num_shards` must be a positive power of two (e.g. 4, 8, 16, 32).
+    /// Mirrors Velox's configurable `numShards` constructor parameter.
+    ///
+    /// # Panics
+    /// Panics if `num_shards` is zero or not a power of two.
+    pub fn new_with_shards(max_bytes: u64, num_shards: usize) -> Arc<Self> {
+        assert!(num_shards > 0, "num_shards must be positive");
+        assert!(
+            num_shards.is_power_of_two(),
+            "num_shards must be a power of two, got {num_shards}"
+        );
+        let shard_mask = (num_shards as u64) - 1;
+        let shards = (0..num_shards).map(|_| CacheShard::new()).collect();
         Arc::new(Self {
             shards,
+            shard_mask,
             max_bytes,
             total_bytes: AtomicU64::new(0),
             hits: AtomicU64::new(0),
@@ -429,7 +452,7 @@ impl MemoryCache {
                         // loaded_bytes and total_bytes for this shard.
                         {
                             let mut inner =
-                                self.shards[shard_idx(&key)].inner.lock().unwrap();
+                                self.shards[shard_idx(&key, self.shard_mask)].inner.lock().unwrap();
                             inner.loaded_bytes += size;
                             self.total_bytes.fetch_add(size, Ordering::Relaxed);
                         }
@@ -488,7 +511,7 @@ impl MemoryCache {
     /// `Loading` state and the caller *must* drive the load and update the
     /// state — exactly Velox's exclusive-pin contract.
     fn find_or_create(&self, key: &DataCacheKey) -> (Arc<CacheEntry>, bool) {
-        let idx = shard_idx(key);
+        let idx = shard_idx(key, self.shard_mask);
         let mut inner = self.shards[idx].inner.lock().unwrap();
 
         if let Some(existing) = inner.entries.get(key) {
@@ -503,7 +526,7 @@ impl MemoryCache {
 
     /// Remove an entry from its shard's map and adjust byte counters.
     fn remove_entry(&self, key: &DataCacheKey) {
-        let idx = shard_idx(key);
+        let idx = shard_idx(key, self.shard_mask);
         let mut inner = self.shards[idx].inner.lock().unwrap();
         if let Some(entry) = inner.entries.remove(key) {
             let size = entry.data_size.load(Ordering::Relaxed);
@@ -533,7 +556,7 @@ impl MemoryCache {
         let overage = current - self.max_bytes;
         // Spread eviction across shards; each shard is responsible for freeing
         // its share plus enough to absorb the new insertion.
-        let per_shard = (overage / NUM_SHARDS as u64).max(inserted_bytes);
+        let per_shard = (overage / self.shards.len() as u64).max(inserted_bytes);
         let mut total_freed = 0u64;
         for shard in &self.shards {
             if total_freed >= overage {
@@ -607,6 +630,55 @@ mod tests {
 
     fn key(file_id: u64, offset: u64, length: u64) -> DataCacheKey {
         DataCacheKey { file_id, offset, length }
+    }
+
+    // ── Shard configuration tests (mirrors Velox's numShardsDefault / numShardsInvalid) ─
+
+    #[test]
+    fn test_default_shard_count() {
+        let cache = MemoryCache::new(1024 * 1024);
+        assert_eq!(cache.shards.len(), DEFAULT_NUM_SHARDS);
+    }
+
+    #[test]
+    fn test_custom_shard_count_power_of_two() {
+        for &n in &[1usize, 2, 4, 8, 32, 64] {
+            let cache = MemoryCache::new_with_shards(1024 * 1024, n);
+            assert_eq!(cache.shards.len(), n);
+            // shard_mask must be n-1
+            assert_eq!(cache.shard_mask, (n as u64) - 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "power of two")]
+    fn test_non_power_of_two_shards_panics() {
+        MemoryCache::new_with_shards(1024 * 1024, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "positive")]
+    fn test_zero_shards_panics() {
+        MemoryCache::new_with_shards(1024 * 1024, 0);
+    }
+
+    #[tokio::test]
+    async fn test_single_shard_cache_works() {
+        // Degenerate case: 1 shard — all entries in one map, still correct.
+        let cache = MemoryCache::new_with_shards(10 * 1024 * 1024, 1);
+        let k = key(0, 0, 4);
+        let bytes = cache
+            .get_or_load(k.clone(), Box::pin(async { Ok(Bytes::from_static(b"hi")) }))
+            .await
+            .unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"hi"));
+        // Second call — hit.
+        let bytes2 = cache
+            .get_or_load(k, Box::pin(async { Ok(Bytes::from_static(b"miss")) }))
+            .await
+            .unwrap();
+        assert_eq!(bytes2, Bytes::from_static(b"hi"));
+        assert_eq!(cache.stats().hits, 1);
     }
 
     #[tokio::test]

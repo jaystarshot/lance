@@ -154,19 +154,13 @@ struct CacheShardInner {
  /// Clock-hand eviction ring (entries_ dense array).
  /// `Weak` lets us skip already-freed entries without a map lookup.
     eviction_ring: Vec<Weak<CacheEntry>>,
- /// Current position of the clock hand in `eviction_ring`.
     clock_hand: usize,
- /// Sum of `data_size` for all `Loaded` entries in this shard.
-    loaded_bytes: u64,
- /// Cached 80th-percentile eviction score — recomputed periodically.
- ///
- /// Initialised to `u64::MAX` (kNoThreshold = INT_MAX) so that
- /// nothing is evicted until the first calibration pass completes. Without
- /// this, freshly-loaded entries (score = 0) immediately pass the `>=`
- /// check and are evicted before they can be reused.
     eviction_threshold: u64,
- /// Events since last calibration.
     events: usize,
+    // Stats — plain u64 protected by the shard mutex (same as Velox).
+    hits: u64,
+    misses: u64,
+    evictions: u64,
 }
 
 impl CacheShardInner {
@@ -175,9 +169,11 @@ impl CacheShardInner {
             entries: HashMap::new(),
             eviction_ring: Vec::new(),
             clock_hand: 0,
-            loaded_bytes: 0,
-            eviction_threshold: u64::MAX, // nothing evictable until first calibration
+            eviction_threshold: u64::MAX,
             events: 0,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
         }
     }
 
@@ -303,7 +299,7 @@ impl CacheShardInner {
                     evicted.push((entry.key.clone(), bytes));
                 }
                 entry.data_size.store(0, Ordering::Relaxed);
-                self.loaded_bytes = self.loaded_bytes.saturating_sub(size);
+                self.evictions += 1;
                 freed += size;
             }
  // If remove returned None the entry was already evicted or removed
@@ -320,23 +316,67 @@ impl CacheShardInner {
     }
 }
 
+/// Per-shard stats snapshot.
+pub struct ShardStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub evictions: u64,
+}
+
 struct CacheShard {
     inner: Mutex<CacheShardInner>,
-    /// Per-shard stats — AtomicU64 so they can be read and written without
-    /// holding the shard mutex.  This eliminates cross-shard cache-line
-    /// contention: threads on different shards never touch the same cache line.
-    hits: AtomicU64,
-    misses: AtomicU64,
-    evictions: AtomicU64,
 }
 
 impl CacheShard {
     fn new() -> Self {
-        Self {
-            inner: Mutex::new(CacheShardInner::new()),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
+        Self { inner: Mutex::new(CacheShardInner::new()) }
+    }
+
+    /// Look up or atomically create an entry for `key`.
+    /// Increments hits/misses inside the lock — no external tracking needed.
+    fn find_or_create(&self, key: &DataCacheKey) -> (Arc<CacheEntry>, bool) {
+        let mut inner = self.inner.lock().unwrap();
+
+        if inner.entries.contains_key(key) {
+            inner.hits += 1;
+            let entry = inner.entries.get(key).unwrap().clone();
+            return (entry, false);
+        }
+
+        inner.misses += 1;
+        let entry = CacheEntry::new(key.clone());
+        inner.entries.insert(key.clone(), entry.clone());
+        inner.eviction_ring.push(Arc::downgrade(&entry));
+        (entry, true)
+    }
+
+    /// Remove an entry from the shard and return its byte size (for total_bytes adjustment).
+    fn remove(&self, key: &DataCacheKey) -> Option<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(entry) = inner.entries.remove(key) {
+            let size = entry.data_size.load(Ordering::Relaxed);
+            entry.data_size.store(0, Ordering::Relaxed);
+            if size > 0 {
+            }
+            Some(size)
+        } else {
+            None
+        }
+    }
+
+    /// Run the clock-hand eviction sweep.
+    /// Increments evictions inside the lock.
+    fn evict(&self, target_bytes: u64) -> (u64, Vec<(DataCacheKey, Bytes)>) {
+        self.inner.lock().unwrap().evict(target_bytes)
+    }
+
+    /// Return a stats snapshot.
+    fn stats(&self) -> ShardStats {
+        let inner = self.inner.lock().unwrap();
+        ShardStats {
+            hits: inner.hits,
+            misses: inner.misses,
+            evictions: inner.evictions,
         }
     }
 }
@@ -440,11 +480,15 @@ impl MemoryCache {
     }
 
     pub fn stats(&self) -> MemoryCacheStats {
-        // Sweep all shards and sum their per-shard counters.
-        // No locks needed — per-shard AtomicU64s are read with a plain load.
-        let hits = self.shards.iter().map(|s| s.hits.load(Ordering::Relaxed)).sum();
-        let misses = self.shards.iter().map(|s| s.misses.load(Ordering::Relaxed)).sum();
-        let evictions = self.shards.iter().map(|s| s.evictions.load(Ordering::Relaxed)).sum();
+        // Sweep all shards — each briefly acquires its own lock.
+        // Locks are held for microseconds; stats reads are infrequent.
+        let (hits, misses, evictions) = self.shards.iter().fold(
+            (0u64, 0u64, 0u64),
+            |(h, m, e), shard| {
+                let s = shard.stats();
+                (h + s.hits, m + s.misses, e + s.evictions)
+            },
+        );
         MemoryCacheStats {
             hits,
             misses,
@@ -502,9 +546,7 @@ impl MemoryCache {
         entry: &Arc<CacheEntry>,
         loader: BoxFuture<'_, Result<Bytes>>,
     ) -> Result<Bytes> {
-        let shard = &self.shards[shard_idx(key, self.shard_mask)];
-        shard.misses.fetch_add(1, Ordering::Relaxed);
-
+        // misses are already counted in find_or_create (inside the shard lock)
         match loader.await {
             Ok(bytes) => {
                 let size = bytes.len() as u64;
@@ -516,14 +558,7 @@ impl MemoryCache {
                 // dropped in CacheEntry::new), leaving the channel stuck at
                 // Loading and causing waiters to hang forever.
                 entry.state_tx.send_replace(LoadState::Loaded(bytes.clone()));
-                // Update both counters under the shard lock so that a
-                // concurrent eviction always sees a consistent view of
-                // loaded_bytes and total_bytes for this shard.
-                {
-                    let mut inner = shard.inner.lock().unwrap();
-                    inner.loaded_bytes += size;
-                    self.total_bytes.fetch_add(size, Ordering::Relaxed);
-                }
+                self.total_bytes.fetch_add(size, Ordering::Relaxed);
                 self.maybe_evict(size);
                 Ok(bytes)
             }
@@ -544,10 +579,9 @@ impl MemoryCache {
     /// should retry as the new exclusive owner).
     async fn wait_for_entry(
         &self,
-        key: &DataCacheKey,
+        _key: &DataCacheKey,
         entry: &Arc<CacheEntry>,
     ) -> Option<Bytes> {
-        let shard = &self.shards[shard_idx(key, self.shard_mask)];
         let mut rx = entry.state_tx.subscribe();
         loop {
             // Clone so the borrow on `rx` ends before the next `rx.changed()`
@@ -556,7 +590,7 @@ impl MemoryCache {
             match state {
                 LoadState::Loaded(bytes) => {
                     entry.touch();
-                    shard.hits.fetch_add(1, Ordering::Relaxed);
+                    // hits are counted in find_or_create (inside the shard lock)
                     return Some(bytes);
                 }
                 LoadState::Failed => {
@@ -578,34 +612,14 @@ impl MemoryCache {
 
     /// Atomically find or create an entry for `key`.
  ///
- /// Returns `(entry, is_new)`. When `is_new` is `true` the entry is in
- /// `Loading` state and the caller *must* drive the load and update the
- /// state — exactly exclusive-pin contract.
     fn find_or_create(&self, key: &DataCacheKey) -> (Arc<CacheEntry>, bool) {
-        let idx = shard_idx(key, self.shard_mask);
-        let mut inner = self.shards[idx].inner.lock().unwrap();
-
-        if let Some(existing) = inner.entries.get(key) {
-            return (existing.clone(), false);
-        }
-
-        let entry = CacheEntry::new(key.clone());
-        inner.entries.insert(key.clone(), entry.clone());
-        inner.eviction_ring.push(Arc::downgrade(&entry));
-        (entry, true)
+        self.shards[shard_idx(key, self.shard_mask)].find_or_create(key)
     }
 
- /// Remove an entry from its shard's map and adjust byte counters.
     fn remove_entry(&self, key: &DataCacheKey) {
         let idx = shard_idx(key, self.shard_mask);
-        let mut inner = self.shards[idx].inner.lock().unwrap();
-        if let Some(entry) = inner.entries.remove(key) {
-            let size = entry.data_size.load(Ordering::Relaxed);
- // Zero data_size so any subsequent eviction-ring sweep skips this
- // entry without double-counting.
-            entry.data_size.store(0, Ordering::Relaxed);
+        if let Some(size) = self.shards[idx].remove(key) {
             if size > 0 {
-                inner.loaded_bytes = inner.loaded_bytes.saturating_sub(size);
                 self.total_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                         Some(v.saturating_sub(size))
@@ -633,19 +647,15 @@ impl MemoryCache {
             if total_freed >= overage {
                 break;
             }
-            let (freed, evicted) = shard.inner.lock().unwrap().evict(per_shard);
+            let (freed, evicted) = shard.evict(per_shard);
             if freed > 0 {
                 self.total_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                         Some(v.saturating_sub(freed))
                     })
                     .ok();
-                shard.evictions.fetch_add(1, Ordering::Relaxed);
                 total_freed += freed;
             }
-            // Collect all evicted entries across shards into one batch.
-            // We notify the sink once after the full sweep so it can make
-            // a threshold decision over the complete set.
             all_evicted.extend(evicted);
         }
 
@@ -962,7 +972,6 @@ mod tests {
     }
 
  /// staleEntry / double-eviction test: verify that
- /// `total_bytes` and per-shard `loaded_bytes` stay consistent after many
  /// evictions. A double-decrement bug would make `total_bytes` underflow
  /// causing `maybe_evict` to stop triggering.
     #[tokio::test]

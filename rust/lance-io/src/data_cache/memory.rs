@@ -460,44 +460,35 @@ impl MemoryCache {
  /// triggers `loader`; all others wait for it to complete via the entry's
  /// `watch` channel — exactly CoalescedLoad::loadOrFuture.
  ///
- /// `loader` is wrapped in an `Option` so the inner loop can consume it
+
     /// Fetch bytes for `key`, calling `loader` on a cache miss.
     ///
-    /// Coordinates two internal paths:
     /// - **Exclusive path** (`is_new = true`): this task owns the entry and
     ///   calls `load_exclusive` to fetch and populate the cache.
     /// - **Waiter path** (`is_new = false`): another task is already loading;
     ///   `wait_for_entry` subscribes to the watch channel and returns when done.
-    ///
-    /// If the loading task fails, `wait_for_entry` returns `None` and the loop
-    /// retries — this task becomes the new owner and calls the loader itself.
+    ///   If the concurrent load failed, returns an error — the caller should retry.
     pub async fn get_or_load(&self, key: DataCacheKey, loader: BoxFuture<'_, Result<Bytes>>) -> Result<Bytes> {
         if self.max_bytes == 0 {
             return loader.await;
         }
 
-        let mut loader = Some(loader);
+        let (entry, is_new) = self.find_or_create(&key);
 
-        loop {
-            let (entry, is_new) = self.find_or_create(&key);
-
-            if is_new {
-                // Exclusive path: we own this entry, call the loader.
-                return self
-                    .load_exclusive(&key, &entry, loader.take().expect("loader consumed twice"))
-                    .await;
-            }
-
-            // Entry already exists — three possible states:
-            //   Loaded  → bytes returned immediately (no suspend, fast path)
-            //   Loading → we suspend on the watch channel until the owning
-            //             task finishes and sends Loaded or Failed
-            //   Failed  → returns None; we loop back to become the new owner
-            if let Some(bytes) = self.wait_for_entry(&key, &entry).await {
-                return Ok(bytes);
-            }
-            // Previous load failed — loop back to become the new owner.
+        if is_new {
+            return self.load_exclusive(&key, &entry, loader).await;
         }
+
+        // Entry exists — wait for the current owner to finish.
+        // Three possible states when we check:
+        //   Loaded  → bytes returned immediately, no suspend (fast path)
+        //   Loading → suspend on watch channel until owner sends Loaded/Failed
+        //   Failed  → owner's load failed; surface the error to the caller
+        self.wait_for_entry(&key, &entry).await.ok_or_else(|| {
+            lance_core::Error::io(
+                "concurrent cache load failed; retry the operation".to_string(),
+            )
+        })
     }
 
     /// Exclusive load path: called when this task created the cache entry.
@@ -1055,21 +1046,25 @@ mod tests {
             .map(|h| h.unwrap())
             .collect();
 
- // The first loader failed → exactly 1 error returned.
-        let errors = results.iter().filter(|r| r.is_err()).count();
-        let successes = results.iter().filter(|r| r.is_ok()).count();
+        // Without the retry loop, ALL tasks see an error when the exclusive
+        // load fails — the first because its loader returned Err, the rest
+        // because wait_for_entry sees Failed and surfaces an error.
+        // Callers are responsible for retrying at a higher level.
         assert!(first_call_done.load(Ordering::SeqCst), "first loader never ran");
-        assert_eq!(errors, 1, "expected exactly 1 error from the failing loader");
-        assert_eq!(successes, 7);
+        assert!(
+            results.iter().all(|r| r.is_err()),
+            "all tasks should get an error when the exclusive load fails"
+        );
 
- // After the failure the entry was retried by a waiter and cached.
- // A subsequent load of the same key returns the cached value.
+        // A fresh get_or_load after all tasks have returned starts clean —
+        // the failed entry was removed, so this succeeds as a new miss.
         let bytes = cache
             .get_or_load(k, Box::pin(async { Ok(Bytes::from_static(b"fresh")) }))
             .await
             .unwrap();
- // The waiter's retry cached b"ok"; we get that back, not b"fresh".
-        assert_eq!(bytes, Bytes::from_static(b"ok"));
+        // No retry happened — entry was removed after failure.
+        // This fresh call is a new miss and loads b"fresh".
+        assert_eq!(bytes, Bytes::from_static(b"fresh"));
     }
 
  /// fuzz test: 8 concurrent tasks randomly reading

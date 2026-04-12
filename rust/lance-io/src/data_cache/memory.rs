@@ -36,7 +36,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use object_store::path::Path;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use lance_core::Result;
 
@@ -332,6 +332,24 @@ impl CacheShard {
     }
 }
 
+// ─── EvictionSink ────────────────────────────────────────────────────────────
+
+/// Receives evicted cache entries for async persistence to the SSD tier.
+///
+/// Implementations accumulate entries and trigger batch writes when
+/// configurable thresholds are exceeded — mirroring the threshold-based
+/// trigger used in the reference design.
+///
+/// The trait is object-safe and sync so it can be called from within the
+/// shard mutex without any async overhead.
+pub trait EvictionSink: Send + Sync + std::fmt::Debug {
+    /// Called from `maybe_evict` with all entries evicted in one sweep.
+    ///
+    /// `total_cache_bytes` is the current `total_bytes` counter — used to
+    /// compute the ratio-based threshold.
+    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes)>, total_cache_bytes: u64);
+}
+
 // ─── MemoryCache ─────────────────────────────────────────────────────────────
 
 /// Statistics snapshot for a [`MemoryCache`].
@@ -363,10 +381,9 @@ pub struct MemoryCache {
     hits: AtomicU64,
     misses: AtomicU64,
     evictions: AtomicU64,
- /// When set, evicted entries are forwarded here so the SSD tier can
- /// persist them asynchronously `ssd_saveable` write pattern.
- /// Uses a bounded channel with `try_send` so eviction never blocks.
-    eviction_tx: Option<mpsc::Sender<(DataCacheKey, Bytes)>>,
+    /// Optional sink that receives evicted entries for SSD persistence.
+    /// When `None`, evicted bytes are simply dropped.
+    eviction_sink: Option<Arc<dyn EvictionSink>>,
 }
 
 impl std::fmt::Debug for MemoryCache {
@@ -379,29 +396,27 @@ impl std::fmt::Debug for MemoryCache {
 }
 
 impl MemoryCache {
- /// Create a new cache with the default shard count ([`DEFAULT_NUM_SHARDS`]).
+    /// Create a new cache with the default shard count ([`DEFAULT_NUM_SHARDS`]).
     pub fn new(max_bytes: u64) -> Arc<Self> {
         Self::new_with_shards(max_bytes, DEFAULT_NUM_SHARDS)
     }
 
- /// Create a new cache with a custom shard count.
- ///
- /// `num_shards` must be a positive power of two (e.g. 4, 8, 16, 32).
- /// Mirrors configurable `numShards` constructor parameter.
- ///
- /// # Panics
- /// Panics if `num_shards` is zero or not a power of two.
+    /// Create a new cache with a custom shard count.
+    ///
+    /// `num_shards` must be a positive power of two (e.g. 4, 8, 16, 32).
+    ///
+    /// # Panics
+    /// Panics if `num_shards` is zero or not a power of two.
     pub fn new_with_shards(max_bytes: u64, num_shards: usize) -> Arc<Self> {
-        Self::with_eviction_channel(max_bytes, num_shards, None)
+        Self::with_eviction_sink(max_bytes, num_shards, None)
     }
 
- /// Create a cache that forwards evicted entries to `eviction_tx` for
- /// lazy SSD persistence background write pattern.
- /// The channel is bounded; if full, eviction writes are dropped (best-effort).
-    pub fn with_eviction_channel(
+    /// Create a cache that notifies `sink` when entries are evicted, allowing
+    /// the SSD tier to persist them asynchronously using threshold-based batching.
+    pub fn with_eviction_sink(
         max_bytes: u64,
         num_shards: usize,
-        eviction_tx: Option<mpsc::Sender<(DataCacheKey, Bytes)>>,
+        eviction_sink: Option<Arc<dyn EvictionSink>>,
     ) -> Arc<Self> {
         assert!(num_shards > 0, "num_shards must be positive");
         assert!(
@@ -418,7 +433,7 @@ impl MemoryCache {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
-            eviction_tx,
+            eviction_sink,
         })
     }
 
@@ -575,19 +590,16 @@ impl MemoryCache {
             return;
         }
         let overage = current - self.max_bytes;
- // Spread eviction across shards; each shard is responsible for freeing
- // its share plus enough to absorb the new insertion.
         let per_shard = (overage / self.shards.len() as u64).max(inserted_bytes);
         let mut total_freed = 0u64;
+        let mut all_evicted: Vec<(DataCacheKey, Bytes)> = Vec::new();
+
         for shard in &self.shards {
             if total_freed >= overage {
                 break;
             }
             let (freed, evicted) = shard.inner.lock().unwrap().evict(per_shard);
             if freed > 0 {
- // Use fetch_update with saturating_sub to guard against
- // concurrent evictions both subtracting from total_bytes
- // simultaneously, which could otherwise wrap a u64 to MAX.
                 self.total_bytes
                     .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                         Some(v.saturating_sub(freed))
@@ -596,15 +608,19 @@ impl MemoryCache {
                 self.evictions.fetch_add(1, Ordering::Relaxed);
                 total_freed += freed;
             }
- // Forward evicted bytes to SSD tier (lazy write pattern).
- // Using try_send: if the channel is full we drop the write rather than
- // block the eviction path. The data remains in the object store.
-            if !evicted.is_empty() {
-                if let Some(tx) = &self.eviction_tx {
-                    for item in evicted {
-                        tx.try_send(item).ok();
-                    }
-                }
+            // Collect all evicted entries across shards into one batch.
+            // We notify the sink once after the full sweep so it can make
+            // a threshold decision over the complete set.
+            all_evicted.extend(evicted);
+        }
+
+        // Notify the eviction sink with the full batch.
+        // The sink (SsdWriter) accumulates and triggers a write when its
+        // threshold (16 MB or 12.5% of cache) is exceeded.
+        if !all_evicted.is_empty() {
+            if let Some(sink) = &self.eviction_sink {
+                let total_cache_bytes = self.total_bytes.load(Ordering::Relaxed);
+                sink.on_evicted(all_evicted, total_cache_bytes);
             }
         }
     }

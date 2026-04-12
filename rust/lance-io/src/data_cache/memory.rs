@@ -488,8 +488,11 @@ impl MemoryCache {
                     .await;
             }
 
-            // Waiter path: another task is loading — subscribe and wait.
-            // Returns None if the load failed; we then retry as the new owner.
+            // Entry already exists — three possible states:
+            //   Loaded  → bytes returned immediately (no suspend, fast path)
+            //   Loading → we suspend on the watch channel until the owning
+            //             task finishes and sends Loaded or Failed
+            //   Failed  → returns None; we loop back to become the new owner
             if let Some(bytes) = self.wait_for_entry(&key, &entry).await {
                 return Ok(bytes);
             }

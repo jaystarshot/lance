@@ -461,8 +461,16 @@ impl MemoryCache {
  /// `watch` channel — exactly CoalescedLoad::loadOrFuture.
  ///
  /// `loader` is wrapped in an `Option` so the inner loop can consume it
- /// exactly once even when the first attempt finds an existing (then-failed)
- /// entry and must retry.
+    /// Fetch bytes for `key`, calling `loader` on a cache miss.
+    ///
+    /// Coordinates two internal paths:
+    /// - **Exclusive path** (`is_new = true`): this task owns the entry and
+    ///   calls `load_exclusive` to fetch and populate the cache.
+    /// - **Waiter path** (`is_new = false`): another task is already loading;
+    ///   `wait_for_entry` subscribes to the watch channel and returns when done.
+    ///
+    /// If the loading task fails, `wait_for_entry` returns `None` and the loop
+    /// retries — this task becomes the new owner and calls the loader itself.
     pub async fn get_or_load(&self, key: DataCacheKey, loader: BoxFuture<'_, Result<Bytes>>) -> Result<Bytes> {
         if self.max_bytes == 0 {
             return loader.await;
@@ -474,81 +482,107 @@ impl MemoryCache {
             let (entry, is_new) = self.find_or_create(&key);
 
             if is_new {
- // ── We own this entry (exclusive, like kExclusive pin) ──
-                let loader = loader.take().expect("loader consumed twice");
-                self.shards[shard_idx(&key, self.shard_mask)].misses.fetch_add(1, Ordering::Relaxed);
-
-                match loader.await {
-                    Ok(bytes) => {
-                        let size = bytes.len() as u64;
-                        entry.data_size.store(size, Ordering::Release);
-                        entry.touch();
- // Transition to shared — wakes all waiting tasks.
- // Must use send_replace() not send(): send() silently
- // drops the value when there are no active receivers
- // (the initial _rx was dropped in CacheEntry::new),
- // leaving the channel stuck at Loading so any waiter
- // that subscribes later hangs forever on changed().await.
-                        entry.state_tx.send_replace(LoadState::Loaded(bytes.clone()));
- // Update both counters under the shard lock so that a
- // concurrent eviction always sees a consistent view of
- // loaded_bytes and total_bytes for this shard.
-                        {
-                            let mut inner =
-                                self.shards[shard_idx(&key, self.shard_mask)].inner.lock().unwrap();
-                            inner.loaded_bytes += size;
-                            self.total_bytes.fetch_add(size, Ordering::Relaxed);
-                        }
-                        self.maybe_evict(size);
-                        return Ok(bytes);
-                    }
-                    Err(e) => {
- // Load failed — signal waiters, remove entry so the
- // next caller gets a fresh miss. Equivalent to 
- // `CachePin::release()` on an exclusive pin.
-                        entry.state_tx.send_replace(LoadState::Failed);
-                        self.remove_entry(&key);
-                        return Err(e);
-                    }
-                }
+                // Exclusive path: we own this entry, call the loader.
+                return self
+                    .load_exclusive(&key, &entry, loader.take().expect("loader consumed twice"))
+                    .await;
             }
 
- // ── Entry exists: wait for the loading task to finish ──
-            let mut rx = entry.state_tx.subscribe();
-            loop {
- // Clone the current state so we release the borrow on `rx`
- // before calling `rx.changed()` (which also takes `&mut rx`).
-                let state = rx.borrow_and_update().clone();
-                match state {
-                    LoadState::Loaded(bytes) => {
-                        entry.touch();
-                        self.shards[shard_idx(&key, self.shard_mask)].hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(bytes);
-                    }
-                    LoadState::Failed => {
- // The loading task failed. The entry has been (or is
- // being) removed from the map. We retry from scratch so
- // that *this* task can attempt the load with its own
- // loader — identical to the waiter retry in after a
- // cancelled CoalescedLoad.
-                        break;
-                    }
-                    LoadState::Loading => {
- // Still in flight — yield until the state changes.
-                        if rx.changed().await.is_err() {
- // Sender dropped unexpectedly; treat as failure.
-                            break;
-                        }
-                    }
-                }
+            // Waiter path: another task is loading — subscribe and wait.
+            // Returns None if the load failed; we then retry as the new owner.
+            if let Some(bytes) = self.wait_for_entry(&key, &entry).await {
+                return Ok(bytes);
             }
- // The previous load failed; loop back and try to become the new owner.
+            // Previous load failed — loop back to become the new owner.
         }
     }
 
- // ── Private helpers ──────────────────────────────────────────────────────
+    /// Exclusive load path: called when this task created the cache entry.
+    ///
+    /// Runs `loader`, stores the result in the entry, and wakes all waiters.
+    /// On failure, signals waiters and removes the entry so the next caller
+    /// can retry with a fresh miss.
+    async fn load_exclusive(
+        &self,
+        key: &DataCacheKey,
+        entry: &Arc<CacheEntry>,
+        loader: BoxFuture<'_, Result<Bytes>>,
+    ) -> Result<Bytes> {
+        let shard = &self.shards[shard_idx(key, self.shard_mask)];
+        shard.misses.fetch_add(1, Ordering::Relaxed);
 
- /// Atomically find or create an entry for `key`.
+        match loader.await {
+            Ok(bytes) => {
+                let size = bytes.len() as u64;
+                entry.data_size.store(size, Ordering::Release);
+                entry.touch();
+                // Transition to shared — wakes all waiting tasks.
+                // Must use send_replace() not send(): send() silently drops
+                // the value when there are no receivers (the initial _rx was
+                // dropped in CacheEntry::new), leaving the channel stuck at
+                // Loading and causing waiters to hang forever.
+                entry.state_tx.send_replace(LoadState::Loaded(bytes.clone()));
+                // Update both counters under the shard lock so that a
+                // concurrent eviction always sees a consistent view of
+                // loaded_bytes and total_bytes for this shard.
+                {
+                    let mut inner = shard.inner.lock().unwrap();
+                    inner.loaded_bytes += size;
+                    self.total_bytes.fetch_add(size, Ordering::Relaxed);
+                }
+                self.maybe_evict(size);
+                Ok(bytes)
+            }
+            Err(e) => {
+                // Signal waiters and remove the entry so the next caller
+                // gets a fresh miss and can retry with their own loader.
+                entry.state_tx.send_replace(LoadState::Failed);
+                self.remove_entry(key);
+                Err(e)
+            }
+        }
+    }
+
+    /// Waiter path: subscribes to `entry`'s watch channel and waits until the
+    /// loading task transitions it to `Loaded` or `Failed`.
+    ///
+    /// Returns `Some(bytes)` on success, `None` if the load failed (caller
+    /// should retry as the new exclusive owner).
+    async fn wait_for_entry(
+        &self,
+        key: &DataCacheKey,
+        entry: &Arc<CacheEntry>,
+    ) -> Option<Bytes> {
+        let shard = &self.shards[shard_idx(key, self.shard_mask)];
+        let mut rx = entry.state_tx.subscribe();
+        loop {
+            // Clone so the borrow on `rx` ends before the next `rx.changed()`
+            // call (which also needs `&mut rx`).
+            let state = rx.borrow_and_update().clone();
+            match state {
+                LoadState::Loaded(bytes) => {
+                    entry.touch();
+                    shard.hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(bytes);
+                }
+                LoadState::Failed => {
+                    // Loading task failed — caller will retry as new owner.
+                    return None;
+                }
+                LoadState::Loading => {
+                    // Still in flight — yield until state changes.
+                    if rx.changed().await.is_err() {
+                        // Sender dropped unexpectedly; treat as failure.
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────────────
+
+    /// Atomically find or create an entry for `key`.
  ///
  /// Returns `(entry, is_new)`. When `is_new` is `true` the entry is in
  /// `Loading` state and the caller *must* drive the load and update the

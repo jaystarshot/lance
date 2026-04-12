@@ -823,6 +823,62 @@ fn is_overlapping(range1: &Range<u64>, range2: &Range<u64>) -> bool {
     range1.start < range2.end && range2.start < range1.end
 }
 
+/// Serve `ranges` from the two-tier cache, falling back to the object store
+/// on a miss.
+///
+/// Each range is checked against the cache independently.  All futures are
+/// driven concurrently via [`futures::future::try_join_all`]:
+///
+/// - **Cache hit**  — the future resolves immediately; no IoQueue interaction.
+/// - **Cache miss** — the loader synchronously enqueues an [`IoTask`] and
+///   returns a future.  Because `try_join_all` polls every future before
+///   awaiting any result, **all IoTasks enter the queue before we wait for
+///   the first response** — the same parallelism as the uncached batch path.
+///
+/// # TODO
+/// This function is a temporary home for the cache logic.  The long-term
+/// design (Option A) is to introduce a `CacheAwareScheduler: IoScheduler`
+/// wrapper so that `FileScheduler` has zero cache awareness:
+///
+/// ```text
+/// pub trait IoScheduler { fn submit_request_boxed(...); ... }
+/// impl IoScheduler for ScanScheduler { /* no cache */ }
+/// impl IoScheduler for CacheAwareScheduler { /* cache logic here */ }
+/// FileScheduler.root: Arc<dyn IoScheduler>   // was Arc<ScanScheduler>
+/// ```
+async fn submit_request_with_cache(
+    cache: Arc<dyn DataCache>,
+    path: object_store::path::Path,
+    ranges: Vec<Range<u64>>,
+    reader: Arc<dyn Reader>,
+    root: Arc<ScanScheduler>,
+    priority: u128,
+) -> Result<Vec<Bytes>> {
+    let futs: Vec<BoxFuture<'static, Result<Bytes>>> = ranges
+        .iter()
+        .map(|range| {
+            let cache  = cache.clone();
+            let path   = path.clone();
+            let r      = reader.clone();
+            let rt     = root.clone();
+            let rng    = range.clone();
+            let offset = range.start;
+            let length = range.end - range.start;
+
+            let loader: BoxFuture<'static, Result<Bytes>> = Box::pin(async move {
+                let mut v = rt.submit_request(r, vec![rng], priority).await?;
+                Ok(v.remove(0))
+            });
+
+            Box::pin(async move {
+                cache.get_or_load(&path, offset, length, loader).await
+            }) as BoxFuture<'static, Result<Bytes>>
+        })
+        .collect();
+
+    futures::future::try_join_all(futs).await
+}
+
 impl FileScheduler {
     /// Submit a batch of I/O requests to the reader
     ///
@@ -905,63 +961,14 @@ impl FileScheduler {
 
         async move {
             let bytes_vec: Vec<Bytes> = if let Some(cache) = data_cache {
-                // Cache-aware path: build one future per range and drive them
-                // all concurrently via try_join_all.
-                //
-                // For cache HITS  — the future resolves immediately with no
-                // IoQueue interaction.
-                //
-                // For cache MISSES — the loader calls root.submit_request which
-                // synchronously enqueues an IoTask and returns a future.
-                // try_join_all polls every future before awaiting any result, so
-                // ALL IoTasks enter the queue before we wait for the first
-                // response — the same parallelism as the original batch path.
-                //
-                // TODO: Refactor to a proper IoScheduler trait abstraction
-                // (Option A design) so that FileScheduler has no awareness of
-                // the cache and this conditional disappears entirely:
-                //
-                //   pub trait IoScheduler: Send + Sync {
-                //       fn submit_request_boxed(...) -> BoxFuture<'static, ...>;
-                //       fn record_request(&self, ranges: &[Range<u64>]);
-                //       fn open_file_with_priority(...) -> BoxFuture<...>;
-                //   }
-                //   impl IoScheduler for ScanScheduler { ... }
-                //   impl IoScheduler for CacheAwareScheduler { ... }  // cache logic here
-                //
-                //   FileScheduler.root: Arc<dyn IoScheduler>  // was Arc<ScanScheduler>
-                //
-                // scan.rs would create a CacheAwareScheduler wrapping ScanScheduler
-                // when a data cache is configured, and pass it to open_file.
-                // FragReadConfig.scan_scheduler would change to Arc<dyn IoScheduler>.
-                let futs: Vec<BoxFuture<'static, lance_core::Result<Bytes>>> =
-                    updated_requests
-                        .iter()
-                        .map(|range| {
-                            // Move everything into the future so it is 'static.
-                            let cache = cache.clone();
-                            let path  = path.clone();
-                            let r     = reader.clone();
-                            let rt    = root.clone();
-                            let rng   = range.clone();
-                            let offset = range.start;
-                            let length = range.end - range.start;
-
-                            let loader: BoxFuture<'static, lance_core::Result<Bytes>> =
-                                Box::pin(async move {
-                                    let mut v =
-                                        rt.submit_request(r, vec![rng], priority).await?;
-                                    Ok(v.remove(0))
-                                });
-
-                            Box::pin(async move {
-                                cache.get_or_load(&path, offset, length, loader).await
-                            }) as BoxFuture<'static, lance_core::Result<Bytes>>
-                        })
-                        .collect();
-
-                futures::future::try_join_all(futs).await?
+                submit_request_with_cache(
+                    cache, path, updated_requests.clone(), reader, root, priority,
+                )
+                .await?
             } else {
+                // No cache: await the pre-queued IoQueue batch.
+                // The future was created synchronously above so all IoTasks
+                // are already in the queue — preserving the original parallelism.
                 bytes_vec_fut.unwrap().await?
             };
 

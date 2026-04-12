@@ -9,8 +9,8 @@ use object_store::path::Path;
 
 /// Interns file paths as compact `u64` identifiers for use in cache keys.
 ///
-/// Modelled after Velox's `FileIds` / `StringIdMap`: a global registry that
-/// maps each unique path string to a stable numeric ID.  The ID is allocated
+/// Modelled after FileIds / `StringIdMap`: a global registry that
+/// maps each unique path string to a stable numeric ID. The ID is allocated
 /// once and never changes for the lifetime of the cache, so it is safe to use
 /// as a hash-map key without holding any lock after the first lookup.
 ///
@@ -38,8 +38,8 @@ impl FileIds {
         }
     }
 
-    /// Return the stable numeric ID for `path`, registering it if this is the
-    /// first time it is seen.
+ /// Return the stable numeric ID for `path`, registering it if this is the
+ /// first time it is seen.
     pub fn get_or_intern(&self, path: &Path) -> u64 {
         let key = path.as_ref();
         let mut map = self.map.lock().unwrap();

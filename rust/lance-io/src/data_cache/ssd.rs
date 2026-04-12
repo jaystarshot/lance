@@ -35,10 +35,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{
-    Arc, RwLock,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 use lance_core::Result;
@@ -178,16 +175,17 @@ impl RegionTracker {
 // ─── SsdFileState (inside RwLock) ────────────────────────────────────────────
 
 struct SsdFileState {
- /// Entry index: key → location on disk. entries_.
     entries: HashMap<DataCacheKey, SsdRun>,
- /// Bytes written into each region. 0 = empty/evicted. regionSizes_.
     region_sizes: Vec<u32>,
- /// Region indices that have available space. writableRegions_.
     writable_regions: Vec<u32>,
- /// Total number of allocated (possibly partially used) regions.
     num_regions: u32,
- /// Per-region access-frequency tracker. SsdFileTracker tracker_.
     tracker: RegionTracker,
+    // Stats — plain u64 protected by the RwLock.
+    // Updated when we already hold the write lock, so no extra atomics needed.
+    bytes_written: u64,
+    bytes_read: u64,
+    entries_written: u64,
+    entries_read: u64,
 }
 
 impl SsdFileState {
@@ -198,6 +196,10 @@ impl SsdFileState {
             writable_regions: Vec::new(),
             num_regions: 0,
             tracker: RegionTracker::new(),
+            bytes_written: 0,
+            bytes_read: 0,
+            entries_written: 0,
+            entries_read: 0,
         }
     }
 
@@ -287,6 +289,15 @@ impl SsdFileState {
 
 // ─── SsdFile ─────────────────────────────────────────────────────────────────
 
+/// Per-file stats snapshot returned by [`SsdFile::stats`].
+#[derive(Debug, Default, Clone)]
+struct SsdFileStats {
+    bytes_written: u64,
+    bytes_read: u64,
+    entries_written: u64,
+    entries_read: u64,
+}
+
 /// One SSD cache file managing N × 64 MiB regions.
 ///
 /// `pread` / `pwrite` calls are issued without holding any in-memory lock —
@@ -301,10 +312,6 @@ struct SsdFile {
  /// Mutable index and region metadata.
     state: RwLock<SsdFileState>,
  // Stats — atomic so they can be read without acquiring any lock.
-    bytes_written: AtomicU64,
-    bytes_read: AtomicU64,
-    entries_written: AtomicU64,
-    entries_read: AtomicU64,
 }
 
 impl std::fmt::Debug for SsdFile {
@@ -336,10 +343,6 @@ impl SsdFile {
             file: Arc::new(file),
             max_regions,
             state: RwLock::new(SsdFileState::new()),
-            bytes_written: AtomicU64::new(0),
-            bytes_read: AtomicU64::new(0),
-            entries_written: AtomicU64::new(0),
-            entries_read: AtomicU64::new(0),
         }))
     }
 
@@ -350,7 +353,7 @@ impl SsdFile {
  /// Phase 1 (read lock): index lookup.
  /// Phase 2 (no lock): `pread` from disk.
  /// Phase 3 (write lock): update tracker.
-    fn do_get(&self, key: &DataCacheKey) -> Option<Bytes> {
+    fn get(&self, key: &DataCacheKey) -> Option<Bytes> {
  // Phase 1: index lookup — read lock (brief).
         let run = {
             let state = self.state.read().unwrap();
@@ -372,10 +375,9 @@ impl SsdFile {
             let mut state = self.state.write().unwrap();
             state.tracker.region_read(run.region, size as u64);
             state.tracker.file_touched();
+            state.bytes_read += size as u64;
+            state.entries_read += 1;
         }
-
-        self.bytes_read.fetch_add(size as u64, Ordering::Relaxed);
-        self.entries_read.fetch_add(1, Ordering::Relaxed);
 
         Some(Bytes::from(buf))
     }
@@ -389,7 +391,7 @@ impl SsdFile {
  /// Phase 3 (write lock): register in entry index.
  ///
  /// Equivalent to write(pins) for a single entry.
-    fn do_insert(&self, key: DataCacheKey, data: &[u8]) -> std::io::Result<()> {
+    fn insert(&self, key: DataCacheKey, data: &[u8]) -> std::io::Result<()> {
         let size = data.len() as u32;
         if size == 0 || size as u64 > REGION_SIZE {
  // Skip empty or oversized entries (same as size cap).
@@ -424,16 +426,11 @@ impl SsdFile {
                 (file_offset - region as u64 * REGION_SIZE) as u32;
             state.entries.insert(
                 key,
-                SsdRun {
-                    region,
-                    offset_in_region,
-                    size,
-                },
+                SsdRun { region, offset_in_region, size },
             );
+            state.bytes_written += size as u64;
+            state.entries_written += 1;
         }
-
-        self.bytes_written.fetch_add(size as u64, Ordering::Relaxed);
-        self.entries_written.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -444,7 +441,7 @@ impl SsdFile {
  /// single `write_at` call (equivalent to writev batch).
  ///
  /// Equivalent to write(pins).
-    fn do_insert_many(
+    fn insert_many(
         &self,
         mut entries: Vec<(DataCacheKey, Bytes)>,
     ) -> std::io::Result<()> {
@@ -527,20 +524,18 @@ impl SsdFile {
                 #[cfg(unix)]
                 use std::os::unix::fs::FileExt;
                 self.file.write_all_at(&batch_buf, batch_file_offset)?;
-
-                let total = batch_buf.len() as u64;
-                self.bytes_written.fetch_add(total, Ordering::Relaxed);
-                self.entries_written
-                    .fetch_add(batch_runs.len() as u64, Ordering::Relaxed);
                 batch_buf.clear();
             }
 
- // Register all batch entries in the index — write lock (brief).
             {
                 let mut state = self.state.write().unwrap();
+                let n = batch_runs.len() as u64;
+                let b: u64 = batch_runs.iter().map(|(idx, _)| entries[*idx].1.len() as u64).sum();
                 for (idx, run) in batch_runs {
                     state.entries.insert(entries[idx].0.clone(), run);
                 }
+                state.bytes_written += b;
+                state.entries_written += n;
             }
         }
         Ok(())
@@ -555,7 +550,7 @@ impl SsdFile {
  /// 2. Sort by file offset.
  /// 3. Group consecutive entries whose gap is below `max_gap` into batches.
  /// 4. For each batch: single `read_at` spanning the full range, then slice.
-    fn do_get_many(&self, keys: &[DataCacheKey]) -> Vec<Option<Bytes>> {
+    fn get_many(&self, keys: &[DataCacheKey]) -> Vec<Option<Bytes>> {
         if keys.is_empty() {
             return Vec::new();
         }
@@ -646,14 +641,22 @@ impl SsdFile {
                 state.tracker.region_read(run.region, run.size as u64);
             }
             state.tracker.file_touched();
+            state.bytes_read += total_bytes;
+            state.entries_read += valid_runs.len() as u64;
         }
 
-        self.bytes_read.fetch_add(total_bytes, Ordering::Relaxed);
-        self.entries_read
-            .fetch_add(valid_runs.len() as u64, Ordering::Relaxed);
-
- // Reassemble in original key order.
         (0..keys.len()).map(|i| result_bufs.remove(&i)).collect()
+    }
+
+    /// Return a stats snapshot (briefly acquires read lock).
+    fn stats(&self) -> SsdFileStats {
+        let s = self.state.read().unwrap();
+        SsdFileStats {
+            bytes_written: s.bytes_written,
+            bytes_read: s.bytes_read,
+            entries_written: s.entries_written,
+            entries_read: s.entries_read,
+        }
     }
 }
 
@@ -760,7 +763,7 @@ impl SsdCache {
     pub async fn get(&self, key: &DataCacheKey) -> Option<Bytes> {
         let file = self.select_file(key.file_id).clone();
         let key = key.clone();
-        tokio::task::spawn_blocking(move || file.do_get(&key))
+        tokio::task::spawn_blocking(move || file.get(&key))
             .await
             .ok()?
     }
@@ -793,7 +796,7 @@ impl SsdCache {
             tasks.push(tokio::task::spawn_blocking(move || {
                 let shard_keys: Vec<DataCacheKey> =
                     keyed.iter().map(|(_, k)| k.clone()).collect();
-                let results = file.do_get_many(&shard_keys);
+                let results = file.get_many(&shard_keys);
                 keyed
                     .into_iter()
                     .zip(results)
@@ -817,7 +820,7 @@ impl SsdCache {
     pub async fn insert(&self, key: DataCacheKey, data: Bytes) {
         let file = self.select_file(key.file_id).clone();
         tokio::task::spawn_blocking(move || {
-            if let Err(e) = file.do_insert(key, &data) {
+            if let Err(e) = file.insert(key, &data) {
                 tracing::warn!("SSD cache write failed: {}", e);
             }
         })
@@ -850,7 +853,7 @@ impl SsdCache {
             }
             let file = file.clone();
             tasks.push(tokio::task::spawn_blocking(move || {
-                if let Err(e) = file.do_insert_many(shard_entries) {
+                if let Err(e) = file.insert_many(shard_entries) {
                     tracing::warn!("SSD cache batch write failed: {}", e);
                 }
             }));
@@ -858,29 +861,14 @@ impl SsdCache {
         futures::future::join_all(tasks).await;
     }
 
- /// Return a snapshot of aggregate statistics across all shard files.
+    /// Return a snapshot of aggregate statistics across all shard files.
     pub fn stats(&self) -> SsdCacheStats {
+        let file_stats: Vec<SsdFileStats> = self.files.iter().map(|f| f.stats()).collect();
         SsdCacheStats {
-            bytes_written: self
-                .files
-                .iter()
-                .map(|f| f.bytes_written.load(Ordering::Relaxed))
-                .sum(),
-            bytes_read: self
-                .files
-                .iter()
-                .map(|f| f.bytes_read.load(Ordering::Relaxed))
-                .sum(),
-            entries_written: self
-                .files
-                .iter()
-                .map(|f| f.entries_written.load(Ordering::Relaxed))
-                .sum(),
-            entries_read: self
-                .files
-                .iter()
-                .map(|f| f.entries_read.load(Ordering::Relaxed))
-                .sum(),
+            bytes_written: file_stats.iter().map(|s| s.bytes_written).sum(),
+            bytes_read: file_stats.iter().map(|s| s.bytes_read).sum(),
+            entries_written: file_stats.iter().map(|s| s.entries_written).sum(),
+            entries_read: file_stats.iter().map(|s| s.entries_read).sum(),
         }
     }
 }

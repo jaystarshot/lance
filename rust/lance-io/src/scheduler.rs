@@ -866,12 +866,24 @@ async fn submit_request_with_cache(
             let length = range.end - range.start;
 
             let loader: BoxFuture<'static, Result<Bytes>> = Box::pin(async move {
+                tracing::debug!(
+                    offset = offset,
+                    length = length,
+                    "data cache miss — fetching from object store"
+                );
                 let mut v = rt.submit_request(r, vec![rng], priority).await?;
                 Ok(v.remove(0))
             });
 
             Box::pin(async move {
-                cache.get_or_load(&path, offset, length, loader).await
+                let bytes = cache.get_or_load(&path, offset, length, loader).await?;
+                tracing::debug!(
+                    offset = offset,
+                    length = length,
+                    "data cache served {} bytes",
+                    bytes.len()
+                );
+                Ok(bytes)
             }) as BoxFuture<'static, Result<Bytes>>
         })
         .collect();
@@ -897,7 +909,6 @@ impl FileScheduler {
         request: Vec<Range<u64>>,
         priority: u64,
     ) -> impl Future<Output = Result<Vec<Bytes>>> + Send + use<> {
- // The final priority is a combination of the row offset and the file number
         let priority = ((self.base_priority as u128) << 64) + priority as u128;
 
         let mut merged_requests = Vec::with_capacity(request.len());

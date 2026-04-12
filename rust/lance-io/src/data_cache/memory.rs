@@ -576,6 +576,13 @@ impl MemoryCache {
         match loader.await {
             Ok(bytes) => {
                 let size = bytes.len() as u64;
+                tracing::trace!(
+                    file_id = key.file_id,
+                    offset = key.offset,
+                    length = key.length,
+                    size_bytes = size,
+                    "memory cache miss — entry loaded and stored"
+                );
                 entry.data_size.store(size, Ordering::Release);
                 entry.touch();
                 // Transition to shared — wakes all waiting tasks.
@@ -606,7 +613,7 @@ impl MemoryCache {
     /// should retry as the new exclusive owner).
     async fn wait_for_entry(
         &self,
-        _key: &DataCacheKey,
+        key: &DataCacheKey,
         entry: &Arc<CacheEntry>,
     ) -> Option<Bytes> {
         let mut rx = entry.state_tx.subscribe();
@@ -617,6 +624,13 @@ impl MemoryCache {
             match state {
                 LoadState::Loaded(bytes) => {
                     entry.touch();
+                    tracing::trace!(
+                        file_id = key.file_id,
+                        offset = key.offset,
+                        length = key.length,
+                        size_bytes = bytes.len(),
+                        "memory cache hit"
+                    );
                     // hits are counted in find_or_create (inside the shard lock)
                     return Some(bytes);
                 }

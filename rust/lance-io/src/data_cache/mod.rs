@@ -686,4 +686,72 @@ mod tests {
         }
         assert_eq!(cache.memory_stats().hits, 5);
     }
+
+    /// Verify that memory eviction actually triggers SSD writes and entries
+    /// can be served from SSD on a subsequent memory miss.
+    ///
+    /// Uses 1 MiB entries so the ratio threshold (12.5% of 8 MiB = 1 MiB)
+    /// fires on the first eviction, guaranteeing the SSD write happens without
+    /// needing to accumulate 16 MiB of pending data.
+    #[tokio::test]
+    async fn test_ssd_writer_threshold_triggers_on_eviction() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = DataCacheConfig {
+            // 8 MiB memory — holds exactly 8 × 1 MiB entries.
+            max_memory_bytes: 8 * 1024 * 1024,
+            num_shards: memory::DEFAULT_NUM_SHARDS,
+            ssd_enabled: true,
+            ssd_cache_dir: Some(tmp.path().join("eviction_test")),
+            // SSD large enough for all entries.
+            ssd_max_bytes: ssd::REGION_SIZE * 4,
+            ssd_num_shards: 1,
+        };
+        let cache = TieredDataCache::new(&config).await.unwrap();
+        let path = Path::from("s3://bucket/data.lance");
+        let entry_size = 1024 * 1024u64; // 1 MiB
+        let n_load = 16u64; // load 16 entries → 8 evicted from memory
+
+        // Load 16 entries. After entry 8 the memory is full and evictions start.
+        // The ratio threshold (12.5% × 8 MiB = 1 MiB) fires on the first
+        // 1 MiB eviction, spawning a batch SSD write immediately.
+        for i in 0..n_load {
+            let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
+            cache
+                .get_or_load(
+                    &path,
+                    i * entry_size,
+                    entry_size,
+                    Box::pin(async move { Ok(data) }),
+                )
+                .await
+                .unwrap();
+        }
+
+        // Wait for the async SSD write(s) to complete.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The first 8 entries were evicted from memory and should now be on SSD.
+        // Read them back — the loader must NOT be called (SSD hit expected).
+        let evicted_count = 8u64;
+        for i in 0..evicted_count {
+            let expected = (i % 256) as u8;
+            let result = cache
+                .get_or_load(
+                    &path,
+                    i * entry_size,
+                    entry_size,
+                    Box::pin(async move {
+                        panic!(
+                            "entry {i} missing from both memory and SSD — \
+                             SsdWriter threshold did not fire or write failed"
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(result.len(), entry_size as usize, "entry {i}: wrong size");
+            assert_eq!(result[0], expected, "entry {i}: data corruption");
+        }
+    }
 }

@@ -95,52 +95,56 @@ pub struct DataCacheKey {
 /// ```
 #[derive(Debug, Clone)]
 pub struct DataCacheConfig {
- /// Maximum bytes to hold in the in-memory (L1) cache tier.
+    /// Maximum bytes to hold in the in-memory (L1) cache tier.
     pub max_memory_bytes: u64,
 
- /// Number of independent memory-tier shards. Must be a power of two.
- /// Advanced — defaults to [`memory::DEFAULT_NUM_SHARDS`] (16).
+    /// Number of independent memory-tier shards. Must be a power of two.
+    /// Advanced — defaults to [`memory::DEFAULT_NUM_SHARDS`] (16).
     pub num_shards: usize,
 
- /// Directory on a local SSD for the on-disk (L2) cache tier.
- /// `None` means only the memory tier is active.
+    /// Whether the SSD (L2) tier is enabled.
+    /// Requires `ssd_cache_dir` and `ssd_max_bytes` to be set.
+    pub ssd_enabled: bool,
+
+    /// Directory on a local SSD for the on-disk (L2) cache tier.
+    /// Ignored when `ssd_enabled` is `false`.
     pub ssd_cache_dir: Option<PathBuf>,
 
- /// Maximum bytes the SSD tier may consume.
- /// Ignored when `ssd_cache_dir` is `None`.
+    /// Maximum bytes the SSD tier may consume.
+    /// Ignored when `ssd_enabled` is `false`.
     pub ssd_max_bytes: u64,
 
- /// Number of SSD shard files. Must be a positive power of two.
- /// Advanced — defaults to [`ssd::DEFAULT_NUM_SSD_SHARDS`] (4).
+    /// Number of SSD shard files. Must be a positive power of two.
+    /// Advanced — defaults to [`ssd::DEFAULT_NUM_SSD_SHARDS`] (4).
     pub ssd_num_shards: usize,
 }
 
 impl DataCacheConfig {
- // ── Primary config keys ───────────────────────────────────────────────
- /// Master on/off switch. Must be `"true"` to enable the cache.
+    // ── Primary config keys ───────────────────────────────────────────────
+    /// Master on/off switch. Must be `"true"` to enable the cache.
     pub const KEY_ENABLED: &'static str = "data_cache_enabled";
- /// Memory tier capacity in **bytes**.
+    /// Memory tier capacity in **bytes**.
     pub const KEY_MEMORY_BYTES: &'static str = "data_cache_memory_bytes";
- /// Set to `"true"` to enable the SSD (L2) tier.
+    /// Set to `"true"` to enable the SSD (L2) tier.
     pub const KEY_SSD_ENABLED: &'static str = "data_cache_ssd_enabled";
- /// Directory on local SSD where cache files are stored.
+    /// Directory on local SSD where cache files are stored.
     pub const KEY_SSD_DIR: &'static str = "data_cache_ssd_dir";
- /// SSD tier capacity in **bytes**.
+    /// SSD tier capacity in **bytes**.
     pub const KEY_SSD_BYTES: &'static str = "data_cache_ssd_bytes";
 
- // ── Advanced / rarely-needed keys ────────────────────────────────────
- /// Memory shard count (power of two). Defaults to 16.
+    // ── Advanced / rarely-needed keys ────────────────────────────────────
+    /// Memory shard count (power of two). Defaults to 16.
     pub const KEY_MEMORY_SHARDS: &'static str = "data_cache_memory_shards";
- /// SSD shard-file count (power of two). Defaults to 4.
+    /// SSD shard-file count (power of two). Defaults to 4.
     pub const KEY_SSD_SHARDS: &'static str = "data_cache_ssd_shards";
 
- /// Parse from the merged `storage_options` map.
- ///
- /// Returns `None` when `data_cache_enabled` is absent or not `"true"`.
+    /// Parse from the merged `storage_options` map.
+    ///
+    /// Returns `None` when `data_cache_enabled` is absent or not `"true"`.
     pub fn from_storage_options(opts: &HashMap<String, String>) -> Option<Self> {
         use lance_core::utils::parse::str_is_truthy;
 
- // Master switch — must be explicitly enabled.
+        // Master switch — must be explicitly enabled.
         let enabled = opts
             .get(Self::KEY_ENABLED)
             .map(|v| str_is_truthy(v.trim()))
@@ -155,16 +159,14 @@ impl DataCacheConfig {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(256 * 1024 * 1024); // 256 MiB default
 
+        // SSD is parsed independently — both fields are stored in the struct
+        // so the constructor can use ssd_enabled as an explicit gate.
         let ssd_enabled = opts
             .get(Self::KEY_SSD_ENABLED)
             .map(|v| str_is_truthy(v.trim()))
             .unwrap_or(false);
 
-        let ssd_cache_dir = if ssd_enabled {
-            opts.get(Self::KEY_SSD_DIR).map(PathBuf::from)
-        } else {
-            None
-        };
+        let ssd_cache_dir = opts.get(Self::KEY_SSD_DIR).map(PathBuf::from);
 
         let ssd_max_bytes = opts
             .get(Self::KEY_SSD_BYTES)
@@ -184,6 +186,7 @@ impl DataCacheConfig {
         Some(Self {
             max_memory_bytes,
             num_shards,
+            ssd_enabled,
             ssd_cache_dir,
             ssd_max_bytes,
             ssd_num_shards,
@@ -259,13 +262,24 @@ impl TieredDataCache {
  /// This is lazy write pattern: data reaches the SSD only when the
  /// memory tier can no longer hold it, not on every initial fetch.
     pub async fn new(config: &DataCacheConfig) -> Result<Arc<Self>> {
-        let ssd = if let Some(dir) = &config.ssd_cache_dir {
-            let ssd_config = SsdCacheConfig {
-                cache_dir: dir.clone(),
-                max_bytes: config.ssd_max_bytes,
-                num_shards: config.ssd_num_shards,
-            };
-            Some(SsdCache::new(ssd_config).await?)
+        let ssd = if config.ssd_enabled {
+            match &config.ssd_cache_dir {
+                Some(dir) => {
+                    let ssd_config = SsdCacheConfig {
+                        cache_dir: dir.clone(),
+                        max_bytes: config.ssd_max_bytes,
+                        num_shards: config.ssd_num_shards,
+                    };
+                    Some(SsdCache::new(ssd_config).await?)
+                }
+                None => {
+                    tracing::warn!(
+                        "data_cache_ssd_enabled=true but data_cache_ssd_dir is not set \
+                         — SSD tier disabled"
+                    );
+                    None
+                }
+            }
         } else {
             None
         };
@@ -383,16 +397,19 @@ mod tests {
 
     #[test]
     fn test_config_ssd_disabled_ignores_ssd_keys() {
- // SSD keys present but ssd_enabled = false → no SSD dir
+        // ssd_enabled=false is stored in the struct; the constructor
+        // uses it to skip SSD creation even when ssd_cache_dir is present.
         let opts = HashMap::from([
-            (DataCacheConfig::KEY_ENABLED.to_string(),     "true".to_string()),
+            (DataCacheConfig::KEY_ENABLED.to_string(),      "true".to_string()),
             (DataCacheConfig::KEY_MEMORY_BYTES.to_string(), "1073741824".to_string()),
-            (DataCacheConfig::KEY_SSD_ENABLED.to_string(), "false".to_string()),
-            (DataCacheConfig::KEY_SSD_DIR.to_string(),     "/mnt/nvme/cache".to_string()),
-            (DataCacheConfig::KEY_SSD_BYTES.to_string(),   "107374182400".to_string()),
+            (DataCacheConfig::KEY_SSD_ENABLED.to_string(),  "false".to_string()),
+            (DataCacheConfig::KEY_SSD_DIR.to_string(),      "/mnt/nvme/cache".to_string()),
+            (DataCacheConfig::KEY_SSD_BYTES.to_string(),    "107374182400".to_string()),
         ]);
         let cfg = DataCacheConfig::from_storage_options(&opts).unwrap();
-        assert!(cfg.ssd_cache_dir.is_none(), "SSD should be disabled");
+        assert!(!cfg.ssd_enabled, "ssd_enabled flag must be false");
+        // ssd_cache_dir is parsed but the constructor checks ssd_enabled first
+        assert_eq!(cfg.ssd_cache_dir, Some(PathBuf::from("/mnt/nvme/cache")));
     }
 
     #[test]
@@ -409,6 +426,7 @@ mod tests {
         let config = DataCacheConfig {
             max_memory_bytes: 10 * 1024 * 1024,
             num_shards: memory::DEFAULT_NUM_SHARDS,
+            ssd_enabled: false,
             ssd_cache_dir: None,
             ssd_max_bytes: 0,
             ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
@@ -456,9 +474,10 @@ mod tests {
     async fn test_two_tier_ssd_fallback_data_integrity() {
         let tmp = tempfile::tempdir().unwrap();
         let config = DataCacheConfig {
- // Memory holds only 2 entries — forces eviction to SSD.
+            // Memory holds only 2 entries — forces eviction to SSD.
             max_memory_bytes: 512 * 1024,
             num_shards: memory::DEFAULT_NUM_SHARDS,
+            ssd_enabled: true,
             ssd_cache_dir: Some(tmp.path().join("two_tier")),
             ssd_max_bytes: ssd::REGION_SIZE * 4,
             ssd_num_shards: 1,
@@ -526,6 +545,7 @@ mod tests {
         let config = DataCacheConfig {
             max_memory_bytes: 4 * 1024 * 1024,
             num_shards: memory::DEFAULT_NUM_SHARDS,
+            ssd_enabled: true,
             ssd_cache_dir: Some(tmp.path().join("stats_test")),
             ssd_max_bytes: ssd::REGION_SIZE * 2,
             ssd_num_shards: 1,

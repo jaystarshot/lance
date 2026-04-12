@@ -322,12 +322,21 @@ impl CacheShardInner {
 
 struct CacheShard {
     inner: Mutex<CacheShardInner>,
+    /// Per-shard stats — AtomicU64 so they can be read and written without
+    /// holding the shard mutex.  This eliminates cross-shard cache-line
+    /// contention: threads on different shards never touch the same cache line.
+    hits: AtomicU64,
+    misses: AtomicU64,
+    evictions: AtomicU64,
 }
 
 impl CacheShard {
     fn new() -> Self {
         Self {
             inner: Mutex::new(CacheShardInner::new()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
         }
     }
 }
@@ -378,11 +387,7 @@ pub struct MemoryCache {
     shard_mask: u64,
     max_bytes: u64,
     total_bytes: AtomicU64,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    evictions: AtomicU64,
     /// Optional sink that receives evicted entries for SSD persistence.
-    /// When `None`, evicted bytes are simply dropped.
     eviction_sink: Option<Arc<dyn EvictionSink>>,
 }
 
@@ -430,18 +435,20 @@ impl MemoryCache {
             shard_mask,
             max_bytes,
             total_bytes: AtomicU64::new(0),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
             eviction_sink,
         })
     }
 
     pub fn stats(&self) -> MemoryCacheStats {
+        // Sweep all shards and sum their per-shard counters.
+        // No locks needed — per-shard AtomicU64s are read with a plain load.
+        let hits = self.shards.iter().map(|s| s.hits.load(Ordering::Relaxed)).sum();
+        let misses = self.shards.iter().map(|s| s.misses.load(Ordering::Relaxed)).sum();
+        let evictions = self.shards.iter().map(|s| s.evictions.load(Ordering::Relaxed)).sum();
         MemoryCacheStats {
-            hits: self.hits.load(Ordering::Relaxed),
-            misses: self.misses.load(Ordering::Relaxed),
-            evictions: self.evictions.load(Ordering::Relaxed),
+            hits,
+            misses,
+            evictions,
             current_bytes: self.total_bytes.load(Ordering::Relaxed),
             max_bytes: self.max_bytes,
         }
@@ -469,7 +476,7 @@ impl MemoryCache {
             if is_new {
  // ── We own this entry (exclusive, like kExclusive pin) ──
                 let loader = loader.take().expect("loader consumed twice");
-                self.misses.fetch_add(1, Ordering::Relaxed);
+                self.shards[shard_idx(&key, self.shard_mask)].misses.fetch_add(1, Ordering::Relaxed);
 
                 match loader.await {
                     Ok(bytes) => {
@@ -515,7 +522,7 @@ impl MemoryCache {
                 match state {
                     LoadState::Loaded(bytes) => {
                         entry.touch();
-                        self.hits.fetch_add(1, Ordering::Relaxed);
+                        self.shards[shard_idx(&key, self.shard_mask)].hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(bytes);
                     }
                     LoadState::Failed => {
@@ -605,7 +612,7 @@ impl MemoryCache {
                         Some(v.saturating_sub(freed))
                     })
                     .ok();
-                self.evictions.fetch_add(1, Ordering::Relaxed);
+                shard.evictions.fetch_add(1, Ordering::Relaxed);
                 total_freed += freed;
             }
             // Collect all evicted entries across shards into one batch.

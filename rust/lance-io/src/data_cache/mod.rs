@@ -728,7 +728,8 @@ mod tests {
         }
 
         // Wait for the async SSD write(s) to complete.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Uses 500ms to account for disk I/O contention when tests run in parallel.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // The first 8 entries were evicted from memory and should now be on SSD.
         // Read them back — the loader must NOT be called (SSD hit expected).

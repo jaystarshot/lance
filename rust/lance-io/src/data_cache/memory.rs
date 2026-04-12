@@ -149,15 +149,15 @@ impl CacheEntry {
 // ─── Shard ───────────────────────────────────────────────────────────────────
 
 struct CacheShardInner {
- /// O(1) key → entry lookup (entryMap_).
     entries: HashMap<DataCacheKey, Arc<CacheEntry>>,
- /// Clock-hand eviction ring (entries_ dense array).
- /// `Weak` lets us skip already-freed entries without a map lookup.
     eviction_ring: Vec<Weak<CacheEntry>>,
     clock_hand: usize,
     eviction_threshold: u64,
     events: usize,
-    // Stats — plain u64 protected by the shard mutex (same as Velox).
+    /// Bytes of Loaded entries currently in this shard.
+    /// Decremented on eviction/remove, incremented via record_loaded.
+    loaded_bytes: u64,
+    // Stats — plain u64 protected by the shard mutex.
     hits: u64,
     misses: u64,
     evictions: u64,
@@ -171,6 +171,7 @@ impl CacheShardInner {
             clock_hand: 0,
             eviction_threshold: u64::MAX,
             events: 0,
+            loaded_bytes: 0,
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -299,6 +300,7 @@ impl CacheShardInner {
                     evicted.push((entry.key.clone(), bytes));
                 }
                 entry.data_size.store(0, Ordering::Relaxed);
+                self.loaded_bytes = self.loaded_bytes.saturating_sub(size);
                 self.evictions += 1;
                 freed += size;
             }
@@ -325,49 +327,72 @@ pub struct ShardStats {
 
 struct CacheShard {
     inner: Mutex<CacheShardInner>,
+    /// Capacity limit for this shard in bytes.
+    /// Set at construction as `max_bytes / num_shards`.
+    per_shard_limit: u64,
 }
 
 impl CacheShard {
-    fn new() -> Self {
-        Self { inner: Mutex::new(CacheShardInner::new()) }
+    fn new(per_shard_limit: u64) -> Self {
+        Self {
+            inner: Mutex::new(CacheShardInner::new()),
+            per_shard_limit,
+        }
     }
 
     /// Look up or atomically create an entry for `key`.
-    /// Increments hits/misses inside the lock — no external tracking needed.
-    fn find_or_create(&self, key: &DataCacheKey) -> (Arc<CacheEntry>, bool) {
+    ///
+    /// Evicts BEFORE inserting when `loaded_bytes >= per_shard_limit` —
+    /// same as Velox: allocation failure → makeSpace() → evict → retry.
+    /// Eviction and insertion are atomic within the same lock hold.
+    ///
+    /// Returns `(entry, is_new, freed_bytes, evicted_entries)`.
+    fn find_or_create(
+        &self,
+        key: &DataCacheKey,
+    ) -> (Arc<CacheEntry>, bool, u64, Vec<(DataCacheKey, Bytes)>) {
         let mut inner = self.inner.lock().unwrap();
 
         if inner.entries.contains_key(key) {
             inner.hits += 1;
             let entry = inner.entries.get(key).unwrap().clone();
-            return (entry, false);
+            return (entry, false, 0, Vec::new());
         }
+
+        // Evict before inserting if this shard is at or over its limit.
+        // The new entry is not yet in the map so it won't be a candidate.
+        let (freed, evicted) = if inner.loaded_bytes >= self.per_shard_limit {
+            let to_free = inner.loaded_bytes - self.per_shard_limit;
+            inner.evict(to_free.max(1))
+        } else {
+            (0, Vec::new())
+        };
 
         inner.misses += 1;
         let entry = CacheEntry::new(key.clone());
         inner.entries.insert(key.clone(), entry.clone());
         inner.eviction_ring.push(Arc::downgrade(&entry));
-        (entry, true)
+        (entry, true, freed, evicted)
     }
 
-    /// Remove an entry from the shard and return its byte size (for total_bytes adjustment).
+    /// Record `size` bytes successfully loaded into this shard.
+    fn record_loaded(&self, size: u64) {
+        self.inner.lock().unwrap().loaded_bytes += size;
+    }
+
+    /// Remove an entry from the shard and return its byte size.
     fn remove(&self, key: &DataCacheKey) -> Option<u64> {
         let mut inner = self.inner.lock().unwrap();
         if let Some(entry) = inner.entries.remove(key) {
             let size = entry.data_size.load(Ordering::Relaxed);
             entry.data_size.store(0, Ordering::Relaxed);
             if size > 0 {
+                inner.loaded_bytes = inner.loaded_bytes.saturating_sub(size);
             }
             Some(size)
         } else {
             None
         }
-    }
-
-    /// Run the clock-hand eviction sweep.
-    /// Increments evictions inside the lock.
-    fn evict(&self, target_bytes: u64) -> (u64, Vec<(DataCacheKey, Bytes)>) {
-        self.inner.lock().unwrap().evict(target_bytes)
     }
 
     /// Return a stats snapshot.
@@ -469,7 +494,8 @@ impl MemoryCache {
             "num_shards must be a power of two, got {num_shards}"
         );
         let shard_mask = (num_shards as u64) - 1;
-        let shards = (0..num_shards).map(|_| CacheShard::new()).collect();
+        let per_shard_limit = max_bytes / num_shards as u64;
+        let shards = (0..num_shards).map(|_| CacheShard::new(per_shard_limit)).collect();
         Arc::new(Self {
             shards,
             shard_mask,
@@ -558,8 +584,9 @@ impl MemoryCache {
                 // dropped in CacheEntry::new), leaving the channel stuck at
                 // Loading and causing waiters to hang forever.
                 entry.state_tx.send_replace(LoadState::Loaded(bytes.clone()));
+                let shard = &self.shards[shard_idx(key, self.shard_mask)];
+                shard.record_loaded(size);
                 self.total_bytes.fetch_add(size, Ordering::Relaxed);
-                self.maybe_evict(size);
                 Ok(bytes)
             }
             Err(e) => {
@@ -610,10 +637,22 @@ impl MemoryCache {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    /// Atomically find or create an entry for `key`.
- ///
     fn find_or_create(&self, key: &DataCacheKey) -> (Arc<CacheEntry>, bool) {
-        self.shards[shard_idx(key, self.shard_mask)].find_or_create(key)
+        let (entry, is_new, freed, evicted) =
+            self.shards[shard_idx(key, self.shard_mask)].find_or_create(key);
+        if freed > 0 {
+            self.total_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    Some(v.saturating_sub(freed))
+                })
+                .ok();
+        }
+        if !evicted.is_empty() {
+            if let Some(sink) = &self.eviction_sink {
+                sink.on_evicted(evicted, self.total_bytes.load(Ordering::Relaxed));
+            }
+        }
+        (entry, is_new)
     }
 
     fn remove_entry(&self, key: &DataCacheKey) {
@@ -629,46 +668,6 @@ impl MemoryCache {
         }
     }
 
- /// Trigger eviction across shards if total usage exceeds `max_bytes`.
- ///
- /// Called after every successful insert. Spreads the target eviction
- /// proportionally across all shards to avoid always hammering shard 0.
-    fn maybe_evict(&self, inserted_bytes: u64) {
-        let current = self.total_bytes.load(Ordering::Relaxed);
-        if current <= self.max_bytes {
-            return;
-        }
-        let overage = current - self.max_bytes;
-        let per_shard = (overage / self.shards.len() as u64).max(inserted_bytes);
-        let mut total_freed = 0u64;
-        let mut all_evicted: Vec<(DataCacheKey, Bytes)> = Vec::new();
-
-        for shard in &self.shards {
-            if total_freed >= overage {
-                break;
-            }
-            let (freed, evicted) = shard.evict(per_shard);
-            if freed > 0 {
-                self.total_bytes
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        Some(v.saturating_sub(freed))
-                    })
-                    .ok();
-                total_freed += freed;
-            }
-            all_evicted.extend(evicted);
-        }
-
-        // Notify the eviction sink with the full batch.
-        // The sink (SsdWriter) accumulates and triggers a write when its
-        // threshold (16 MB or 12.5% of cache) is exceeded.
-        if !all_evicted.is_empty() {
-            if let Some(sink) = &self.eviction_sink {
-                let total_cache_bytes = self.total_bytes.load(Ordering::Relaxed);
-                sink.on_evicted(all_evicted, total_cache_bytes);
-            }
-        }
-    }
 }
 
 /// `MemoryCache` implements `DataCache` directly so it can be used standalone
@@ -864,8 +863,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_eviction_under_pressure() {
- // Each entry is 1 MiB; cap the cache at 4 MiB.
-        let cache = MemoryCache::new(4 * 1024 * 1024);
+        // Single shard so all entries concentrate — per-shard eviction fires
+        // when the shard exceeds its limit on the next insert.
+        let cache = MemoryCache::new_with_shards(4 * 1024 * 1024, 1);
         let chunk = Bytes::from(vec![0u8; 1024 * 1024]);
 
         for i in 0..8u64 {
@@ -920,7 +920,8 @@ mod tests {
         let cap = 4 * 1024 * 1024u64;
         let entry_size = 256 * 1024u64; // 256 KiB per entry
         let num_entries = cap / entry_size; // exactly fill the cache (16 entries)
-        let cache = MemoryCache::new(cap);
+        // Single shard — all entries go to same shard, per-shard eviction fires.
+        let cache = MemoryCache::new_with_shards(cap, 1);
 
  // First pass — fill cache exactly to capacity (all misses).
         for i in 0..num_entries {
@@ -1420,7 +1421,9 @@ mod tests {
  /// incremented correctly and reflect the true cache state.
     #[tokio::test]
     async fn test_cache_stats_fields() {
-        let cache = MemoryCache::new(2 * 1024 * 1024);
+        // 4 entries × 256 KiB = 1 MiB. Use 2 MiB capacity + 1 shard so the
+        // single shard's limit (2 MiB) fits all 4 entries with no eviction.
+        let cache = MemoryCache::new_with_shards(2 * 1024 * 1024, 1);
         let entry_size = 256 * 1024u64;
 
  // 4 misses.

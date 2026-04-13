@@ -28,7 +28,7 @@
 
 use std::collections::HashMap;
 use std::sync::{
-    Arc, Mutex, Weak,
+    Arc, Mutex,
     atomic::{AtomicU32, AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -53,10 +53,6 @@ const NUM_EVICTION_SAMPLES: usize = 10;
 
 /// Only entries whose score is at or above this percentile are evicted.
 const EVICTION_PERCENTILE: usize = 80;
-
-/// Recalibrate the threshold after this many shard events (inserts + eviction
-/// checks), matching entries_.size() / 4 heuristic.
-const CALIBRATION_INTERVAL_DIVISOR: usize = 4;
 
 // ─── Time ────────────────────────────────────────────────────────────────────
 
@@ -148,14 +144,27 @@ impl CacheEntry {
 
 // ─── Shard ───────────────────────────────────────────────────────────────────
 
+/// Velox-style dense ring for the clock-hand eviction sweep.
+///
+/// Unlike a `Vec<Weak<CacheEntry>>`, this never accumulates dead pointers:
+/// - Evicted slots are set to `None` and their index goes into `empty_slots`.
+/// - New entries reuse a free slot (pop from `empty_slots`) or append to back.
+/// - `clock_hand` advances through `dense_ring` — `None` slots are skipped
+///   in O(1) with a plain `is_none()` check, no `Weak::upgrade()` needed.
 struct CacheShardInner {
+    /// O(1) key → entry lookup.
     entries: HashMap<DataCacheKey, Arc<CacheEntry>>,
-    eviction_ring: Vec<Weak<CacheEntry>>,
+    /// Dense ring — `None` means the slot is free for reuse.
+    /// Size = high-water mark of concurrent entries ever held.
+    dense_ring: Vec<Option<Arc<CacheEntry>>>,
+    /// Indices of `None` slots available for reuse (Velox's `emptySlots_`).
+    empty_slots: Vec<usize>,
+    /// Clock-hand position in `dense_ring`.
     clock_hand: usize,
+    /// 80th-percentile eviction score threshold.
+    /// `0` = uncalibrated (everything evictable until first calibration).
     eviction_threshold: u64,
-    events: usize,
     /// Bytes of Loaded entries currently in this shard.
-    /// Decremented on eviction/remove, incremented via record_loaded.
     loaded_bytes: u64,
     // Stats — plain u64 protected by the shard mutex.
     hits: u64,
@@ -167,10 +176,10 @@ impl CacheShardInner {
     fn new() -> Self {
         Self {
             entries: HashMap::new(),
-            eviction_ring: Vec::new(),
+            dense_ring: Vec::new(),
+            empty_slots: Vec::new(),
             clock_hand: 0,
-            eviction_threshold: u64::MAX,
-            events: 0,
+            eviction_threshold: 0, // everything evictable until calibration warms up
             loaded_bytes: 0,
             hits: 0,
             misses: 0,
@@ -178,14 +187,28 @@ impl CacheShardInner {
         }
     }
 
- /// Recompute the eviction threshold.
- ///
- /// Samples `NUM_EVICTION_SAMPLES` entries evenly from the ring, sorts their
- /// scores, and sets `eviction_threshold` to the `EVICTION_PERCENTILE`th
- /// percentile value. This is a direct port of 
- /// `CacheShard::calibrateThresholdLocked`.
+    /// Insert `entry` into the dense ring, reusing a free slot when available.
+    fn ring_insert(&mut self, entry: Arc<CacheEntry>) {
+        if let Some(idx) = self.empty_slots.pop() {
+            self.dense_ring[idx] = Some(entry);
+        } else {
+            self.dense_ring.push(Some(entry));
+        }
+    }
+
+    /// Remove entry at `idx` from the ring and mark the slot free.
+    fn ring_evict_slot(&mut self, idx: usize) {
+        self.dense_ring[idx] = None;
+        self.empty_slots.push(idx);
+    }
+
+    /// Recompute the 80th-percentile eviction threshold.
+    ///
+    /// Samples up to `NUM_EVICTION_SAMPLES` (10) entries evenly from the
+    /// dense ring. `None` slots score 0 — they don't bias the threshold
+    /// (same as Velox's `element ? element->score(now) : 0`).
     fn calibrate_threshold(&mut self) {
-        let n = self.eviction_ring.len();
+        let n = self.dense_ring.len();
         if n == 0 {
             self.eviction_threshold = 0;
             return;
@@ -195,123 +218,87 @@ impl CacheShardInner {
         let now = now_ms();
 
         let mut scores: Vec<u64> = (0..num_samples)
-            .filter_map(|i| {
+            .map(|i| {
                 let idx = (self.clock_hand + i * step) % n;
-                self.eviction_ring[idx]
-                    .upgrade()
+                self.dense_ring[idx]
+                    .as_ref()
                     .map(|e| e.eviction_score(now))
+                    .unwrap_or(0)
             })
             .collect();
 
         scores.sort_unstable();
- // percentile(scores, EVICTION_PERCENTILE) — same formula as :
- // `values[(values.size() * percent) / 100]`
         let idx = (scores.len() * EVICTION_PERCENTILE / 100)
             .min(scores.len().saturating_sub(1));
         self.eviction_threshold = scores.get(idx).copied().unwrap_or(0);
-        self.events = 0;
     }
 
- /// Free at least `target_bytes` from this shard using the clock-hand
- /// algorithm. Returns `(bytes_freed, evicted_entries)` where
- /// `evicted_entries` carries the key + live bytes of each evicted entry
- /// so the caller can forward them to the SSD tier write
- /// pattern (`ssd_saveable` entries forwarded to `saveToSsd()`).
- ///
- /// CacheShard::evict.
+    /// Clock-hand sweep following Velox's `CacheShard::evict` exactly.
+    ///
+    /// - `None` slots skipped with `is_none()` — no `Weak::upgrade()`.
+    /// - Calibration fires **mid-sweep** every `n/8` live entries checked,
+    ///   so the threshold adapts as cold entries are removed.
+    /// - Evicted slots written to `empty_slots` for O(1) reuse on next insert.
     fn evict(&mut self, target_bytes: u64) -> (u64, Vec<(DataCacheKey, Bytes)>) {
-        let n = self.eviction_ring.len();
+        let n = self.dense_ring.len();
         if n == 0 {
             return (0, Vec::new());
         }
 
- // Recalibrate periodically — every ~ring_len/4 events.
-        self.events += 1;
-        let calibration_interval = (n / CALIBRATION_INTERVAL_DIVISOR).max(1);
-        if self.events >= calibration_interval {
-            self.calibrate_threshold();
-        }
-
         let now = now_ms();
         let mut freed = 0u64;
-        let mut checked = 0;
+        let mut counter = 0usize;     // raw iterations (Velox's `counter`)
+        let mut num_checked = 0usize; // live entries seen (Velox's `numChecked`)
         let mut evicted: Vec<(DataCacheKey, Bytes)> = Vec::new();
 
-        while freed < target_bytes && checked < n {
+        while counter < n {
             let idx = self.clock_hand % n;
             self.clock_hand = self.clock_hand.wrapping_add(1);
-            checked += 1;
+            counter += 1;
 
-            let Some(entry) = self.eviction_ring[idx].upgrade() else {
- // Entry already freed elsewhere — skip.
+            if self.dense_ring[idx].is_none() {
+                continue; // empty slot — O(1) skip
+            }
+            let entry = self.dense_ring[idx].as_ref().unwrap().clone();
+            num_checked += 1;
+
+            // Mid-sweep recalibration (Velox: `numChecked > entries_.size() / 8`).
+            // Threshold adapts as we evict, preventing over-eviction.
+            if self.eviction_threshold == 0 || num_checked > n / 8 {
+                self.calibrate_threshold();
+                num_checked = 0;
+            }
+
+            // count == 3: entries map + dense_ring slot + our clone.
+            // > 3 means an active external holder — skip.
+            if Arc::strong_count(&entry) > 3 {
                 continue;
-            };
-
- // Why > 2?
- // At this point we hold the shard mutex. The minimum strong_count
- // for any live entry is 2:
- // 1 — inner.entries[key] (the HashMap's Arc)
- // 1 — this upgrade() (our temporary Arc)
- // Any waiter suspended at rx.changed().await holds a third Arc
- // obtained from find_or_create *before* releasing the shard mutex.
- // That waiter is outside the mutex now but still increments the
- // count. So:
- // count == 2 → only map + upgrade → no active users → evict
- // count > 2 → at least one waiter or active reader → skip
- //
- // TODO: uses an explicit `numPins_` atomic (kExclusive = -10000
- // while loading, 0 = evictable, N = N active readers) and a RAII
- // `CachePin` returned to callers that increments/decrements the count.
- // This gives precise "is anyone reading this?" semantics:
- // https://github.com/facebookincubator/velox/blob/main/velox/common/caching/AsyncDataCache.h
- //
- // We deliberately omit CachePin for now because `Bytes` (Arc<[u8]>)
- // already keeps the data alive independently of the cache index — a
- // caller holding `Bytes` is data-safe even if the entry is evicted.
- // The only downside is a potential cache miss on the *next* caller
- // if we evict mid-decode, but the decode window is milliseconds and
- // the clock-hand eviction is probabilistic, making the practical
- // impact negligible. Add CachePin when profiling shows eviction-
- // mid-decode is a meaningful source of cache misses.
-            if Arc::strong_count(&entry) > 2 {
-                continue; // active waiter or reader — don't evict
             }
 
             let size = entry.data_size.load(Ordering::Relaxed);
             if size == 0 {
- // Still loading, previously failed, or already evicted
- // (data_size is zeroed below when an entry is evicted so a
- // second sweep through the ring skips it cheaply).
-                continue;
+                continue; // Loading, Failed, or already evicted
             }
 
             let score = entry.eviction_score(now);
             if score < self.eviction_threshold {
-                continue; // too hot — below eviction threshold
+                continue; // too hot
             }
 
- // Evict: extract bytes for SSD write, remove from map, zero data_size.
- // Bytes are extracted BEFORE zeroing data_size so the SSD writer
- // receives valid data forward pattern.
             if self.entries.remove(&entry.key).is_some() {
- // Grab the bytes from the watch channel while we still hold
- // the Arc (strong_count > 0 so the sender is alive).
                 if let LoadState::Loaded(bytes) = entry.state_tx.borrow().clone() {
                     evicted.push((entry.key.clone(), bytes));
                 }
                 entry.data_size.store(0, Ordering::Relaxed);
+                self.ring_evict_slot(idx);
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(size);
                 self.evictions += 1;
                 freed += size;
-            }
- // If remove returned None the entry was already evicted or removed
- // by the failure path — skip without touching counters.
-        }
 
- // Compact dead Weak pointers to keep the ring from growing unboundedly.
-        if checked == n {
-            self.eviction_ring.retain(|w| w.strong_count() > 0);
-            self.clock_hand = self.clock_hand.min(self.eviction_ring.len());
+                if freed >= target_bytes {
+                    break;
+                }
+            }
         }
 
         (freed, evicted)
@@ -361,9 +348,18 @@ impl CacheShard {
 
         // Evict before inserting if this shard is at or over its limit.
         // The new entry is not yet in the map so it won't be a candidate.
+        //
+        // Evict at least 20% of the shard's capacity rather than just the
+        // overage — this batches evictions so we don't call evict() on every
+        // single insert that nudges over the limit.  After eviction the shard
+        // sits at ~80% capacity, giving a buffer before the next eviction call.
+        // Reduces eviction call frequency by ~5x for workloads with many small
+        // inserts.
+        let batch_evict_bytes = self.per_shard_limit / 5; // 20%
         let (freed, evicted) = if inner.loaded_bytes >= self.per_shard_limit {
-            let to_free = inner.loaded_bytes - self.per_shard_limit;
-            inner.evict(to_free.max(1))
+            let overage = inner.loaded_bytes - self.per_shard_limit;
+            let to_free = overage.max(batch_evict_bytes);
+            inner.evict(to_free)
         } else {
             (0, Vec::new())
         };
@@ -371,7 +367,7 @@ impl CacheShard {
         inner.misses += 1;
         let entry = CacheEntry::new(key.clone());
         inner.entries.insert(key.clone(), entry.clone());
-        inner.eviction_ring.push(Arc::downgrade(&entry));
+        inner.ring_insert(entry.clone());
         (entry, true, freed, evicted)
     }
 

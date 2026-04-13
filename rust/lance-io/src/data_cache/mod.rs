@@ -420,12 +420,6 @@ impl TieredDataCache {
                 } else {
                     0.0
                 };
-                eprintln!(
-                    "[CACHE STATS] memory: hits={} misses={} evictions={} bytes={} hit_rate={:.1}% | ssd: hits={} written={}B",
-                    s.memory_hits, s.memory_misses, s.memory_evictions,
-                    s.memory_current_bytes, hit_rate,
-                    s.ssd_hits, s.ssd_bytes_written,
-                );
                 tracing::info!(
                     memory_hits = s.memory_hits,
                     memory_misses = s.memory_misses,

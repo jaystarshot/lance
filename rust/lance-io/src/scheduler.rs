@@ -854,7 +854,6 @@ async fn submit_request_with_cache(
     root: Arc<ScanScheduler>,
     priority: u128,
 ) -> Result<Vec<Bytes>> {
-    eprintln!("[CACHE] submit_request_with_cache called: {} ranges", ranges.len());
     let futs: Vec<BoxFuture<'static, Result<Bytes>>> = ranges
         .iter()
         .map(|range| {
@@ -867,7 +866,6 @@ async fn submit_request_with_cache(
             let length = range.end - range.start;
 
             let loader: BoxFuture<'static, Result<Bytes>> = Box::pin(async move {
-                eprintln!("[CACHE MISS] offset={offset} length={length}");
                 tracing::debug!(
                     offset = offset,
                     length = length,
@@ -879,12 +877,11 @@ async fn submit_request_with_cache(
 
             Box::pin(async move {
                 let bytes = cache.get_or_load(&path, offset, length, loader).await?;
-                eprintln!("[CACHE SERVED] offset={offset} length={length} size={}", bytes.len());
                 tracing::debug!(
                     offset = offset,
                     length = length,
-                    "data cache served {} bytes",
-                    bytes.len()
+                    size_bytes = bytes.len(),
+                    "data cache served"
                 );
                 Ok(bytes)
             }) as BoxFuture<'static, Result<Bytes>>

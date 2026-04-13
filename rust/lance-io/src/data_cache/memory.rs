@@ -620,7 +620,6 @@ impl MemoryCache {
             match state {
                 LoadState::Loaded(bytes) => {
                     entry.touch();
-                    eprintln!("[CACHE HIT] file_id={} offset={} length={}", key.file_id, key.offset, key.length);
                     tracing::trace!(
                         file_id = key.file_id,
                         offset = key.offset,

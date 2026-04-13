@@ -60,19 +60,6 @@ const DECAY_INTERVAL: u64 = 1_000;
 /// Score decay multiplier applied on each interval.
 const DECAY_FACTOR: f64 = 0.9;
 
-/// Gap threshold (bytes) below which adjacent SSD reads are merged into one
-/// `read_at` call when average payload is small (< 10 KiB).
-/// uses 25 000 bytes in this case.
-const SMALL_PAYLOAD_MAX_GAP: u64 = 25_000;
-
-/// Gap threshold for larger payloads (≥ 10 KiB average).
-/// uses 50 000 bytes.
-const LARGE_PAYLOAD_MAX_GAP: u64 = 50_000;
-
-/// Maximum number of discrete ranges per coalesced read.
-/// uses 900 (safely below IOV_MAX on Linux).
-const MAX_COALESCE_RANGES: usize = 900;
-
 // ─── SsdRun ──────────────────────────────────────────────────────────────────
 
 /// Location of a byte range within an SSD cache file.
@@ -472,113 +459,6 @@ impl SsdFile {
         Ok(())
     }
 
- // ── Batch get (coalesced read path) ───────────────────────────────────
-
- /// Read multiple keys with coalesced `read_at` calls.
- ///
- /// Algorithm (load() / `readPins()`):
- /// 1. Look up all keys → `(key, SsdRun)` pairs (read lock, then released).
- /// 2. Sort by file offset.
- /// 3. Group consecutive entries whose gap is below `max_gap` into batches.
- /// 4. For each batch: single `read_at` spanning the full range, then slice.
-    fn get_many(&self, keys: &[DataCacheKey]) -> Vec<Option<Bytes>> {
-        if keys.is_empty() {
-            return Vec::new();
-        }
-
- // Phase 1: index lookups — read lock (brief).
-        let runs: Vec<Option<SsdRun>> = {
-            let state = self.state.read().unwrap();
-            keys.iter()
-                .map(|k| state.entries.get(k).copied())
-                .collect()
-        };
-
- // Compute average payload size to pick the coalescing gap threshold.
- // : totalPayloadBytes / pins.size() < 10000 ? 25000 : 50000.
-        let valid_runs: Vec<(usize, SsdRun)> = runs
-            .iter()
-            .enumerate()
-            .filter_map(|(i, r)| r.map(|run| (i, run)))
-            .collect();
-
-        if valid_runs.is_empty() {
-            return vec![None; keys.len()];
-        }
-
-        let total_bytes: u64 =
-            valid_runs.iter().map(|(_, r)| r.size as u64).sum();
-        let avg_bytes = total_bytes / valid_runs.len() as u64;
-        let max_gap = if avg_bytes < 10_000 {
-            SMALL_PAYLOAD_MAX_GAP
-        } else {
-            LARGE_PAYLOAD_MAX_GAP
-        };
-
- // Sort by file offset for coalescing.
-        let mut sorted = valid_runs.clone();
-        sorted.sort_by_key(|(_, r)| r.file_offset());
-
- // Phase 2: coalesced reads — no lock.
-        let mut result_bufs: HashMap<usize, Bytes> = HashMap::new();
-
-        let mut batch_start = 0usize;
-        while batch_start < sorted.len() {
- // Determine the span of this coalesced batch.
-            let batch_offset = sorted[batch_start].1.file_offset();
-            let mut batch_end_byte = batch_offset + sorted[batch_start].1.size as u64;
-            let mut batch_end_idx = batch_start + 1;
-
-            while batch_end_idx < sorted.len()
-                && batch_end_idx - batch_start < MAX_COALESCE_RANGES
-            {
-                let next_offset = sorted[batch_end_idx].1.file_offset();
-                if next_offset > batch_end_byte + max_gap {
-                    break; // gap too large — start a new batch
-                }
-                batch_end_byte = batch_end_byte
-                    .max(next_offset + sorted[batch_end_idx].1.size as u64);
-                batch_end_idx += 1;
-            }
-
- // Single read spanning the entire batch (including gaps).
-            let read_len = (batch_end_byte - batch_offset) as usize;
-            let mut buf = vec![0u8; read_len];
-            {
-                #[cfg(unix)]
-                use std::os::unix::fs::FileExt;
-                if self.file.read_exact_at(&mut buf, batch_offset).is_err() {
-                    batch_start = batch_end_idx;
-                    continue;
-                }
-            }
-
- // Slice each entry's bytes out of the combined buffer.
-            for &(key_idx, ref run) in &sorted[batch_start..batch_end_idx] {
-                let start = (run.file_offset() - batch_offset) as usize;
-                let end = start + run.size as usize;
-                if end <= buf.len() {
-                    result_bufs.insert(key_idx, Bytes::copy_from_slice(&buf[start..end]));
-                }
-            }
-
-            batch_start = batch_end_idx;
-        }
-
- // Phase 3: update tracker — write lock (brief).
-        {
-            let mut state = self.state.write().unwrap();
-            for (_, run) in &valid_runs {
-                state.tracker.region_read(run.region, run.size as u64);
-            }
-            state.tracker.file_touched();
-            state.bytes_read += total_bytes;
-            state.entries_read += valid_runs.len() as u64;
-        }
-
-        (0..keys.len()).map(|i| result_bufs.remove(&i)).collect()
-    }
-
     /// Return a stats snapshot (briefly acquires read lock).
     fn stats(&self) -> SsdFileStats {
         let s = self.state.read().unwrap();
@@ -697,54 +577,6 @@ impl SsdCache {
         tokio::task::spawn_blocking(move || file.get(&key))
             .await
             .ok()?
-    }
-
- /// Look up multiple byte ranges in the SSD cache with coalesced reads.
- ///
- /// Entries in the same shard file are read with merged `read_at` calls
- /// when they are within [`SMALL_PAYLOAD_MAX_GAP`] or
- /// [`LARGE_PAYLOAD_MAX_GAP`] of each other / `readPins()`.
-    pub async fn get_many(&self, keys: &[DataCacheKey]) -> Vec<Option<Bytes>> {
-        if keys.is_empty() {
-            return Vec::new();
-        }
-
- // Group keys by shard file, preserving original indices.
-        let mut by_file: Vec<Vec<(usize, DataCacheKey)>> =
-            vec![Vec::new(); self.files.len()];
-        for (i, key) in keys.iter().enumerate() {
-            let idx = (key.file_id & self.file_mask) as usize;
-            by_file[idx].push((i, key.clone()));
-        }
-
- // Fire one spawn_blocking per non-empty shard.
-        let mut tasks = Vec::new();
-        for (file, keyed) in self.files.iter().zip(by_file.into_iter()) {
-            if keyed.is_empty() {
-                continue;
-            }
-            let file = file.clone();
-            tasks.push(tokio::task::spawn_blocking(move || {
-                let shard_keys: Vec<DataCacheKey> =
-                    keyed.iter().map(|(_, k)| k.clone()).collect();
-                let results = file.get_many(&shard_keys);
-                keyed
-                    .into_iter()
-                    .zip(results)
-                    .map(|((orig_idx, _), bytes)| (orig_idx, bytes))
-                    .collect::<Vec<_>>()
-            }));
-        }
-
-        let mut result = vec![None; keys.len()];
-        for task in tasks {
-            if let Ok(shard_results) = task.await {
-                for (orig_idx, bytes) in shard_results {
-                    result[orig_idx] = bytes;
-                }
-            }
-        }
-        result
     }
 
  /// Write multiple byte ranges with sorted, batched `write_at` calls.
@@ -918,14 +750,10 @@ mod tests {
 
         cache.insert_many(entries).await;
 
-        let keys: Vec<DataCacheKey> =
-            (0u64..10).map(|i| key(0, i * 4096, 4096)).collect();
-        let results = cache.get_many(&keys).await;
-
-        assert_eq!(results.len(), 10);
-        for (i, result) in results.iter().enumerate() {
-            assert!(result.is_some(), "entry {i} missing from batch get");
-            assert_eq!(result.as_ref().unwrap()[0], i as u8);
+        for i in 0u64..10 {
+            let result = cache.get(&key(0, i * 4096, 4096)).await;
+            assert!(result.is_some(), "entry {i} missing");
+            assert_eq!(result.unwrap()[0], i as u8);
         }
 
         let stats = cache.stats();
@@ -935,24 +763,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_many_coalesces_reads() {
- // Entries that are adjacent on disk should be read in one pread.
         let cache = make_cache(REGION_SIZE * 4, 1).await;
         let entry_size = 4096u64;
 
- // Write 5 adjacent entries in batch (they'll be sequential on disk).
         let entries: Vec<(DataCacheKey, Bytes)> = (0u64..5)
             .map(|i| (key(0, i * entry_size, entry_size), Bytes::from(vec![i as u8; entry_size as usize])))
             .collect();
         cache.insert_many(entries).await;
 
- // Read them back in a single batch — should coalesce into 1 pread.
-        let keys: Vec<DataCacheKey> =
-            (0u64..5).map(|i| key(0, i * entry_size, entry_size)).collect();
-        let results = cache.get_many(&keys).await;
-
-        for (i, r) in results.iter().enumerate() {
+        for i in 0u64..5 {
+            let r = cache.get(&key(0, i * entry_size, entry_size)).await;
             assert!(r.is_some(), "entry {i} missing");
-            assert_eq!(r.as_ref().unwrap()[0], i as u8);
+            assert_eq!(r.unwrap()[0], i as u8);
         }
     }
 

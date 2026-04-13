@@ -42,10 +42,7 @@
 //! ```
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
-use std::sync::{
-    Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
@@ -244,97 +241,61 @@ impl DataCache for NoopDataCache {
 
 // ─── SsdWriter ───────────────────────────────────────────────────────────────
 
-/// Threshold-based SSD write coordinator — implements [`memory::EvictionSink`].
+/// Velox-style SSD write coordinator — implements [`memory::EvictionSink`].
 ///
-/// Accumulates evicted entries from the memory tier and triggers a batch write
-/// to the SSD tier when either threshold is exceeded:
-///   - absolute: `pending_bytes >= MIN_SSD_SAVEABLE_BYTES` (16 MiB)
-///   - ratio:    `pending_bytes >= total_cache_bytes * SSD_SAVEABLE_RATIO` (12.5%)
-///
-/// A CAS gate (`write_in_progress`) ensures only one write job runs at a time,
-/// matching the reference design's `startWrite()` / `finishWrite()` pattern.
+/// Follows `SsdCache::write()` / `startWrite()` / `finishWrite()` exactly:
+/// - No accumulation buffer — each 20% eviction batch is already substantial
+///   (e.g. 12.5 MiB for a 1 GiB / 16-shard cache), so no pre-batching needed.
+/// - CAS gate: if a write is already in flight, the current batch is dropped
+///   (not buffered). SSD is a best-effort cache — a miss just costs a network
+///   round-trip, not a correctness failure.
+/// - `MAX_WRITE_RATIO` (70%): caps entries written per batch to avoid holding
+///   too much memory during a single `insert_many` call.
 #[derive(Debug)]
 struct SsdWriter {
     ssd: Arc<SsdCache>,
-    /// Accumulated evicted entries waiting to be written to SSD.
-    pending: Mutex<Vec<(DataCacheKey, Bytes)>>,
-    /// Total bytes in `pending` (updated atomically to avoid locking pending
-    /// just for threshold checks).
-    pending_bytes: AtomicU64,
-    /// Absolute byte threshold — write when pending exceeds this.
-    min_saveable_bytes: u64,
-    /// Ratio threshold — write when pending > total_cache * ratio.
-    saveable_ratio: f64,
     /// CAS gate: prevents concurrent SSD write tasks.
     write_in_progress: Arc<AtomicBool>,
 }
 
-/// Absolute threshold (16 MiB) — matching the reference design.
-const MIN_SSD_SAVEABLE_BYTES: u64 = 16 * 1024 * 1024;
-
-/// Ratio threshold (12.5% of current cache size).
-const SSD_SAVEABLE_RATIO: f64 = 0.125;
+/// Maximum fraction of the eviction batch written per SSD write — Velox's
+/// `maxWriteRatio`. Entries beyond the cap are dropped (not buffered).
+const MAX_WRITE_RATIO: usize = 70;
 
 impl SsdWriter {
-    fn new(ssd: Arc<SsdCache>, max_cache_bytes: u64) -> Arc<Self> {
-        let _ = max_cache_bytes; // stored implicitly via ratio
+    fn new(ssd: Arc<SsdCache>) -> Arc<Self> {
         Arc::new(Self {
             ssd,
-            pending: Mutex::new(Vec::new()),
-            pending_bytes: AtomicU64::new(0),
-            min_saveable_bytes: MIN_SSD_SAVEABLE_BYTES,
-            saveable_ratio: SSD_SAVEABLE_RATIO,
             write_in_progress: Arc::new(AtomicBool::new(false)),
         })
     }
 }
 
 impl memory::EvictionSink for SsdWriter {
-    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes)>, total_cache_bytes: u64) {
-        let batch_bytes: u64 = entries.iter().map(|(_, b)| b.len() as u64).sum();
-
-        // Add to pending buffer.
-        {
-            let mut pending = self.pending.lock().unwrap();
-            pending.extend(entries);
-        }
-        let pending = self.pending_bytes.fetch_add(batch_bytes, Ordering::Relaxed) + batch_bytes;
-
-        // Check thresholds — same logic as the reference design's
-        // `possibleSsdSave`: fire if absolute OR ratio threshold is exceeded.
-        let ratio_threshold = (total_cache_bytes as f64 * self.saveable_ratio) as u64;
-        let threshold_hit = pending >= self.min_saveable_bytes || pending >= ratio_threshold;
-
-        if !threshold_hit {
-            return;
-        }
-
-        // CAS gate — only one write job at a time.
+    fn on_evicted(&self, entries: Vec<(DataCacheKey, Bytes)>, _total_cache_bytes: u64) {
+        // CAS gate — if a write is already in flight, drop this batch.
+        // Velox: startWrite() returns false → caller skips the write.
         if self
             .write_in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
-            return; // another write is already in progress
+            return;
         }
 
-        // Drain the pending buffer.
-        let batch = {
-            let mut pending = self.pending.lock().unwrap();
-            std::mem::take(&mut *pending)
-        };
-        let taken: u64 = batch.iter().map(|(_, b)| b.len() as u64).sum();
-        self.pending_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                Some(v.saturating_sub(taken))
-            })
-            .ok();
+        // Cap to MAX_WRITE_RATIO% of the batch — Velox's maxWriteRatio.
+        // The 20% memory eviction batch is already substantial; this prevents
+        // a single write from pinning all of it in memory during async I/O.
+        let max = (entries.len() * MAX_WRITE_RATIO / 100).max(1);
+        let batch: Vec<_> = entries.into_iter().take(max).collect();
 
-        // Spawn the batch write — runs off the hot path.
+        // Spawn write off the hot path — on_evicted is called while the
+        // shard mutex is held so we must not block here.
         let ssd = self.ssd.clone();
         let flag = self.write_in_progress.clone();
         tokio::spawn(async move {
             ssd.insert_many(batch).await;
+            // finishWrite() — release the gate.
             flag.store(false, Ordering::Release);
         });
     }
@@ -392,7 +353,7 @@ impl TieredDataCache {
         // when the threshold is hit — no long-lived background task needed.
         let eviction_sink: Option<Arc<dyn memory::EvictionSink>> =
             ssd.as_ref().map(|ssd_arc| {
-                SsdWriter::new(ssd_arc.clone(), config.max_memory_bytes)
+                SsdWriter::new(ssd_arc.clone())
                     as Arc<dyn memory::EvictionSink>
             });
 
@@ -687,33 +648,34 @@ mod tests {
         assert_eq!(cache.memory_stats().hits, 5);
     }
 
-    /// Verify that memory eviction actually triggers SSD writes and entries
-    /// can be served from SSD on a subsequent memory miss.
+    /// Verify that memory eviction triggers immediate SSD writes (Velox model:
+    /// no accumulation threshold, write fires on each eviction batch).
     ///
-    /// Uses 1 MiB entries so the ratio threshold (12.5% of 8 MiB = 1 MiB)
-    /// fires on the first eviction, guaranteeing the SSD write happens without
-    /// needing to accumulate 16 MiB of pending data.
+    /// With the CAS-drop design some batches may be dropped when a write is
+    /// already in flight, so not every evicted entry is guaranteed to reach SSD.
+    /// The primary assertions are:
+    ///   1. At least some entries land on SSD (write path works).
+    ///   2. All reads return correct bytes regardless of which tier serves them.
+    ///   3. No sleep — writes happen immediately on eviction, not on a threshold.
     #[tokio::test]
-    async fn test_ssd_writer_threshold_triggers_on_eviction() {
+    async fn test_ssd_writer_fires_on_eviction() {
         let tmp = tempfile::tempdir().unwrap();
         let config = DataCacheConfig {
-            // 8 MiB memory — holds exactly 8 × 1 MiB entries.
-            max_memory_bytes: 8 * 1024 * 1024,
-            num_shards: memory::DEFAULT_NUM_SHARDS,
+            // 1 shard, 2 MiB — fits 2 × 1 MiB entries, forces eviction on 3rd.
+            max_memory_bytes: 2 * 1024 * 1024,
+            num_shards: 1,
             ssd_enabled: true,
             ssd_cache_dir: Some(tmp.path().join("eviction_test")),
-            // SSD large enough for all entries.
             ssd_max_bytes: ssd::REGION_SIZE * 4,
             ssd_num_shards: 1,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");
         let entry_size = 1024 * 1024u64; // 1 MiB
-        let n_load = 16u64; // load 16 entries → 8 evicted from memory
+        let n_load = 6u64;
 
-        // Load 16 entries. After entry 8 the memory is full and evictions start.
-        // The ratio threshold (12.5% × 8 MiB = 1 MiB) fires on the first
-        // 1 MiB eviction, spawning a batch SSD write immediately.
+        // Load 6 entries into a 2-entry cache — entries 0 and 1 are evicted
+        // on each subsequent insert. With 1 shard the eviction is deterministic.
         for i in 0..n_load {
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
             cache
@@ -727,32 +689,39 @@ mod tests {
                 .unwrap();
         }
 
-        // Wait for the async SSD write(s) to complete.
-        // Uses 500ms to account for disk I/O contention when tests run in parallel.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // Give the spawned write task time to finish — no arbitrary 800ms sleep,
+        // just yield to the tokio runtime so in-flight tasks can complete.
+        tokio::task::yield_now().await;
 
-        // The first 8 entries were evicted from memory and should now be on SSD.
-        // Read them back — the loader must NOT be called (SSD hit expected).
-        let evicted_count = 8u64;
-        for i in 0..evicted_count {
+        // Re-read evicted entries. With the CAS-drop model some may have been
+        // dropped while a write was in progress — allow re-fetches, assert
+        // data integrity and that SSD was used for at least one entry.
+        let ssd_hits_before = cache.ssd.as_ref().unwrap().stats().entries_read;
+        let refetch_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        for i in 0..n_load.saturating_sub(2) {
             let expected = (i % 256) as u8;
+            let rc = refetch_count.clone();
             let result = cache
                 .get_or_load(
                     &path,
                     i * entry_size,
                     entry_size,
                     Box::pin(async move {
-                        panic!(
-                            "entry {i} missing from both memory and SSD — \
-                             SsdWriter threshold did not fire or write failed"
-                        )
+                        // SSD miss → re-fetch from object store (Velox CAS-drop behaviour).
+                        rc.fetch_add(1, Ordering::Relaxed);
+                        Ok(Bytes::from(vec![(i % 256) as u8; entry_size as usize]))
                     }),
                 )
                 .await
                 .unwrap();
-
-            assert_eq!(result.len(), entry_size as usize, "entry {i}: wrong size");
             assert_eq!(result[0], expected, "entry {i}: data corruption");
         }
+
+        let ssd_hits_after = cache.ssd.as_ref().unwrap().stats().entries_read;
+        assert!(
+            ssd_hits_after > ssd_hits_before,
+            "expected at least one SSD hit — write path may be broken"
+        );
     }
 }

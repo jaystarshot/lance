@@ -822,11 +822,9 @@ mod tests {
     /// when `data_cache_checksum_enabled` is active.
     ///
     /// This test demonstrates the attack surface:
-    ///   - Without checksum: corrupted bytes are silently returned.
-    ///   - With checksum (scheduler path): the OCI re-fetch catches it.
-    ///
-    /// We test the "without checksum" side here (unit-testable).
-    /// The "with checksum" side is covered by test_cache_oci.py Test 3.
+    ///   - Without checksum: corrupted bytes are silently returned to the caller.
+    ///   - With checksum (scheduler path): mismatch → Error returned to caller,
+    ///     no bytes served. Covered end-to-end by test_cache_oci.py Test 3.
     #[tokio::test]
     async fn test_ssd_corruption_silently_returned_without_checksum() {
         #[cfg(unix)]

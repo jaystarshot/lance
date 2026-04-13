@@ -931,32 +931,23 @@ async fn submit_request_with_cache_verify(
         .submit_request(reader, ranges.clone(), priority)
         .await?;
 
-    // Step 3: Compare each range.
+    // Step 3: Compare each range — fail immediately on first mismatch.
     for (i, (cached, source)) in cache_bytes.iter().zip(&source_bytes).enumerate() {
         let offset = ranges[i].start;
         let length = ranges[i].end - ranges[i].start;
         if cached != source {
-            tracing::error!(
-                path = %path,
-                offset = offset,
-                length = length,
-                cached_len = cached.len(),
-                source_len = source.len(),
-                "CACHE CHECKSUM MISMATCH — cached bytes differ from object store"
-            );
-            eprintln!(
-                "[CACHE CHECKSUM MISMATCH] path={path} offset={offset} length={length} \
-                 cached_len={} source_len={}",
+            let msg = format!(
+                "cache checksum mismatch at path={path} offset={offset} length={length}: \
+                 cached {} bytes differ from object store {} bytes — possible corruption",
                 cached.len(), source.len()
             );
+            tracing::error!(%msg, "CACHE CHECKSUM MISMATCH");
+            return Err(lance_core::Error::io(msg));
         } else {
             tracing::debug!(offset = offset, length = length, "cache checksum OK");
         }
     }
 
-    // On mismatch we already logged the error above. Return source_bytes
-    // (the trusted object store data) so callers always get correct bytes
-    // even if the cache is corrupt.
     Ok(source_bytes)
 }
 

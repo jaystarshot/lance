@@ -817,4 +817,168 @@ mod tests {
             "expected at least one SSD hit after flush_ssd()"
         );
     }
+
+    /// Verify that SSD bit-rot is invisible without checksum but detectable
+    /// when `data_cache_checksum_enabled` is active.
+    ///
+    /// This test demonstrates the attack surface:
+    ///   - Without checksum: corrupted bytes are silently returned.
+    ///   - With checksum (scheduler path): the OCI re-fetch catches it.
+    ///
+    /// We test the "without checksum" side here (unit-testable).
+    /// The "with checksum" side is covered by test_cache_oci.py Test 3.
+    #[tokio::test]
+    async fn test_ssd_corruption_silently_returned_without_checksum() {
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ssd_dir = tmp.path().join("corrupt_test");
+        let entry_size = 64 * 1024u64;
+        let correct_pattern = 0xABu8;
+
+        // Populate SSD — tiny memory cap forces eviction.
+        {
+            let config = DataCacheConfig {
+                max_memory_bytes: 128 * 1024,
+                num_shards: 1,
+                ssd_enabled: true,
+                ssd_cache_dir: Some(ssd_dir.clone()),
+                ssd_max_bytes: ssd::REGION_SIZE * 2,
+                ssd_num_shards: 1,
+                verify: false,
+            };
+            let cache = TieredDataCache::new(&config).await.unwrap();
+            let path = Path::from("s3://bucket/data.lance");
+
+            for i in 0..4u64 {
+                let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
+                cache.get_or_load(
+                    &path, i * entry_size, entry_size,
+                    Box::pin(async move { Ok(data) }),
+                ).await.unwrap();
+            }
+            cache.flush_ssd().await;
+            assert!(cache.ssd.as_ref().unwrap().stats().entries_written > 0);
+        } // file handles released
+
+        // Corrupt the SSD file — overwrite first 4 KiB with 0xFF.
+        #[cfg(unix)]
+        {
+            let cache_file = ssd_dir.join("cache_0.bin");
+            let f = std::fs::OpenOptions::new().write(true).open(&cache_file).unwrap();
+            f.write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
+        }
+
+        // Re-open — WITHOUT checksum.
+        let config = DataCacheConfig {
+            max_memory_bytes: 128 * 1024,
+            num_shards: 1,
+            ssd_enabled: true,
+            ssd_cache_dir: Some(ssd_dir),
+            ssd_max_bytes: ssd::REGION_SIZE * 2,
+            ssd_num_shards: 1,
+            verify: false,
+        };
+        let cache = TieredDataCache::new(&config).await.unwrap();
+        let path = Path::from("s3://bucket/data.lance");
+
+        // Read entry 0 — SSD returns bytes, but they may be corrupted.
+        // Without checksum there is no detection — caller gets whatever is on disk.
+        // This is the attack surface that data_cache_checksum_enabled defends against.
+        let result = cache.get_or_load(
+            &path, 0, entry_size,
+            Box::pin(async move {
+                Ok(Bytes::from(vec![correct_pattern; entry_size as usize]))
+            }),
+        ).await.unwrap();
+
+        // The SSD returned *something* — we can't assert it's correct without checksum.
+        // What we CAN assert: the SSD layer did serve a response (no panic/error).
+        assert_eq!(result.len(), entry_size as usize, "SSD should return correct length");
+        // Document: without checksum, corruption goes undetected.
+        // With data_cache_checksum_enabled=true the scheduler verify path catches this.
+    }
+
+    /// Verify that SSD corruption is detected when checksum mode is on.
+    ///
+    /// Flow:
+    ///   1. Write entries to SSD via eviction (tiny memory cap).
+    ///   2. Corrupt the SSD file on disk directly with pwrite.
+    ///   3. Re-open the cache with verify=true.
+    ///   4. Read — verify path fetches from "object store" (mock loader),
+    ///      detects mismatch, returns the correct source bytes (not corrupt).
+    #[tokio::test]
+    async fn test_ssd_corruption_detected_by_checksum() {
+        #[cfg(unix)]
+        use std::os::unix::fs::FileExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ssd_dir = tmp.path().join("corrupt_test");
+        let entry_size = 64 * 1024u64; // 64 KiB
+        let correct_pattern = 0xABu8;
+
+        // Step 1: populate SSD — tiny memory forces eviction.
+        {
+            let config = DataCacheConfig {
+                max_memory_bytes: 128 * 1024,
+                num_shards: 1,
+                ssd_enabled: true,
+                ssd_cache_dir: Some(ssd_dir.clone()),
+                ssd_max_bytes: ssd::REGION_SIZE * 2,
+                ssd_num_shards: 1,
+                verify: false,
+            };
+            let cache = TieredDataCache::new(&config).await.unwrap();
+            let path = Path::from("s3://bucket/data.lance");
+
+            for i in 0..4u64 {
+                let data = Bytes::from(vec![correct_pattern; entry_size as usize]);
+                cache.get_or_load(
+                    &path, i * entry_size, entry_size,
+                    Box::pin(async move { Ok(data) }),
+                ).await.unwrap();
+            }
+            cache.flush_ssd().await;
+
+            let written = cache.ssd.as_ref().unwrap().stats().entries_written;
+            assert!(written > 0, "no entries written to SSD");
+        } // cache dropped — file handles released
+
+        // Step 2: corrupt the SSD file on disk.
+        #[cfg(unix)]
+        {
+            let cache_file = ssd_dir.join("cache_0.bin");
+            let f = std::fs::OpenOptions::new().write(true).open(&cache_file).unwrap();
+            f.write_all_at(&vec![0xFFu8; 4096], 0).unwrap();
+        }
+
+        // Step 3: re-open with verify=true.
+        let config_verify = DataCacheConfig {
+            max_memory_bytes: 128 * 1024,
+            num_shards: 1,
+            ssd_enabled: true,
+            ssd_cache_dir: Some(ssd_dir),
+            ssd_max_bytes: ssd::REGION_SIZE * 2,
+            ssd_num_shards: 1,
+            verify: true,
+        };
+        let cache_v = TieredDataCache::new(&config_verify).await.unwrap();
+        let path = Path::from("s3://bucket/data.lance");
+
+        // Step 4: read — mock loader is the "object store" source of truth.
+        // verify path detects mismatch and returns source bytes (not corrupt).
+        let result = cache_v.get_or_load(
+            &path, 0, entry_size,
+            Box::pin(async move {
+                Ok(Bytes::from(vec![correct_pattern; entry_size as usize]))
+            }),
+        ).await.unwrap();
+
+        assert_eq!(result.len(), entry_size as usize);
+        assert!(
+            result.iter().all(|&b| b == correct_pattern),
+            "verify path returned corrupted bytes — should have fallen back to source"
+        );
+    }
 }

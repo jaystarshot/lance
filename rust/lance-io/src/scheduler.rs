@@ -954,8 +954,10 @@ async fn submit_request_with_cache_verify(
         }
     }
 
-    // Return cache bytes — source bytes were only fetched for verification.
-    Ok(cache_bytes)
+    // On mismatch we already logged the error above. Return source_bytes
+    // (the trusted object store data) so callers always get correct bytes
+    // even if the cache is corrupt.
+    Ok(source_bytes)
 }
 
 impl FileScheduler {

@@ -204,31 +204,6 @@ impl SsdFileState {
     }
 
  /// Find available space for `size` bytes in a writable region, update
- /// `region_sizes` to reserve the space, and return `(file_offset, region)`.
- ///
- /// Returns `None` if no writable region can accommodate the entry.
- /// Equivalent to getSpace() — must be called under write lock.
-    fn get_space(&mut self, size: u32) -> Option<(u64, u32)> {
-        loop {
-            let region = *self.writable_regions.first()?;
-            let used = self.region_sizes[region as usize];
-            let available = REGION_SIZE as u32 - used;
-
-            if size <= available {
- // Reserve space by advancing the region's write pointer.
-                self.region_sizes[region as usize] += size;
-                let file_offset =
-                    region as u64 * REGION_SIZE + used as u64;
-                return Some((file_offset, region));
-            }
-
- // Region too full for this entry — mark as filled, try next.
- // tracker_.regionFilled(region) + writableRegions_.erase().
-            self.tracker.region_filled(region);
-            self.writable_regions.remove(0);
-        }
-    }
-
  /// Grow the file by one region, or evict the least-read regions to free
  /// space. Returns `true` if at least one writable region is now available.
  ///
@@ -284,6 +259,70 @@ impl SsdFileState {
             candidates
         );
         Ok(true)
+    }
+
+    /// Pack as many entries (starting at `from`) as fit into one writable region.
+    ///
+    /// Handles region growth / eviction internally — loops until a region with
+    /// enough space is found or the SSD is full.
+    ///
+    /// Returns `Some((file_offset, buf, runs, next_i))` on success:
+    ///   - `file_offset` — absolute write position in the file
+    ///   - `buf`         — contiguous bytes to pwrite
+    ///   - `runs`        — `(entry_idx, SsdRun)` pairs to register in the index
+    ///   - `next_i`      — first entry index not packed (start for next call)
+    ///
+    /// Returns `None` when the SSD is full and nothing can be evicted.
+    fn pack_region(
+        &mut self,
+        entries: &[(DataCacheKey, Bytes)],
+        from: usize,
+        file: &std::fs::File,
+        max_regions: u32,
+    ) -> std::io::Result<Option<(u64, Vec<u8>, Vec<(usize, SsdRun)>, usize)>> {
+        loop {
+            // Ensure a writable region exists — grow or evict if needed.
+            while self.writable_regions.first().is_none() {
+                if !self.grow_or_evict(file, max_regions)? {
+                    return Ok(None); // SSD full
+                }
+            }
+
+            let region = *self.writable_regions.first().unwrap();
+            let region_start = self.region_sizes[region as usize];
+            let available = REGION_SIZE as u32 - region_start;
+
+            let mut buf = Vec::new();
+            let mut runs: Vec<(usize, SsdRun)> = Vec::new();
+            let mut written = 0u32;
+            let mut j = from;
+
+            while j < entries.len() {
+                let size = entries[j].1.len() as u32;
+                if size == 0 || size as u64 > REGION_SIZE {
+                    j += 1; // skip invalid
+                    continue;
+                }
+                if written + size > available {
+                    break; // region full — remaining entries go to next region
+                }
+                runs.push((j, SsdRun { region, offset_in_region: region_start + written, size }));
+                buf.extend_from_slice(&entries[j].1);
+                written += size;
+                j += 1;
+            }
+
+            if runs.is_empty() {
+                // Nothing fit in this region — seal it and retry with the next.
+                self.tracker.region_filled(region);
+                self.writable_regions.remove(0);
+                continue;
+            }
+
+            self.region_sizes[region as usize] += written;
+            let file_offset = region as u64 * REGION_SIZE + region_start as u64;
+            return Ok(Some((file_offset, buf, runs, j)));
+        }
     }
 }
 
@@ -382,65 +421,12 @@ impl SsdFile {
         Some(Bytes::from(buf))
     }
 
- // ── Single-entry insert ───────────────────────────────────────────────
-
- /// Write `data` for `key` to disk.
- ///
- /// Phase 1 (write lock): reserve space via `get_space()` / `grow_or_evict()`.
- /// Phase 2 (no lock): `pwrite` to disk.
- /// Phase 3 (write lock): register in entry index.
- ///
- /// Equivalent to write(pins) for a single entry.
-    fn insert(&self, key: DataCacheKey, data: &[u8]) -> std::io::Result<()> {
-        let size = data.len() as u32;
-        if size == 0 || size as u64 > REGION_SIZE {
- // Skip empty or oversized entries (same as size cap).
-            return Ok(());
-        }
-
- // Phase 1: reserve space — write lock.
-        let (file_offset, region) = {
-            let mut state = self.state.write().unwrap();
-            loop {
-                if let Some(space) = state.get_space(size) {
-                    break space;
-                }
- // No space in any writable region — grow or evict.
-                if !state.grow_or_evict(&self.file, self.max_regions)? {
-                    return Ok(()); // SSD full, write dropped
-                }
-            }
-        };
-
- // Phase 2: write to disk — no lock.
-        {
-            #[cfg(unix)]
-            use std::os::unix::fs::FileExt;
-            self.file.write_all_at(data, file_offset)?;
-        }
-
- // Phase 3: register entry — write lock (brief).
-        {
-            let mut state = self.state.write().unwrap();
-            let offset_in_region =
-                (file_offset - region as u64 * REGION_SIZE) as u32;
-            state.entries.insert(
-                key,
-                SsdRun { region, offset_in_region, size },
-            );
-            state.bytes_written += size as u64;
-            state.entries_written += 1;
-        }
-        Ok(())
-    }
-
  // ── Batch insert (write path) ─────────────────────────────────────────
 
- /// Write multiple entries sorted by `(key.file_id, key.offset)` for disk
- /// write locality. Entries that fit in the same region are written with a
- /// single `write_at` call (equivalent to writev batch).
- ///
- /// Equivalent to write(pins).
+    /// Write multiple entries to the SSD cache.
+    ///
+    /// Sorted by `(file_id, offset)` for write locality, then packed into
+    /// regions with one `pwrite` per region — same as Velox's `write(pins)`.
     fn insert_many(
         &self,
         mut entries: Vec<(DataCacheKey, Bytes)>,
@@ -448,95 +434,38 @@ impl SsdFile {
         if entries.is_empty() {
             return Ok(());
         }
-
- // Sort by (file_id, offset) — adjacent in storage → adjacent on SSD.
- // : std::sort(pins.begin(), pins.end()).
         entries.sort_by_key(|(k, _)| (k.file_id, k.offset));
 
         let mut i = 0;
         while i < entries.len() {
- // Collect entries that fit into the current writable region.
-            let (batch_file_offset, mut batch_buf, batch_runs) = {
+            // Pack entries into the next available region — lock held only here.
+            let (file_offset, buf, runs, next_i) = {
                 let mut state = self.state.write().unwrap();
-
- // Ensure we have a writable region.
-                loop {
-                    if state.writable_regions.first().is_some() {
-                        break;
-                    }
-                    if !state.grow_or_evict(&self.file, self.max_regions)? {
-                        return Ok(()); // SSD full
-                    }
+                match state.pack_region(&entries, i, &self.file, self.max_regions)? {
+                    Some(r) => r,
+                    None => return Ok(()), // SSD full
                 }
-
-                let region = *state.writable_regions.first().unwrap();
-                let region_start = state.region_sizes[region as usize];
-                let available = REGION_SIZE as u32 - region_start;
-
- // Accumulate as many entries as fit in this region.
-                let mut buf = Vec::new();
-                let mut runs: Vec<(usize, SsdRun)> = Vec::new(); // (entry_idx, run)
-                let mut written_in_region = 0u32;
-
-                let _j_start = i;
-                let mut j = i;
-                while j < entries.len() {
-                    let size = entries[j].1.len() as u32;
-                    if size == 0 || size as u64 > REGION_SIZE {
-                        j += 1; // skip invalid
-                        continue;
-                    }
-                    if written_in_region + size > available {
-                        break; // region full
-                    }
-                    let offset_in_region = region_start + written_in_region;
-                    runs.push((
-                        j,
-                        SsdRun {
-                            region,
-                            offset_in_region,
-                            size,
-                        },
-                    ));
-                    buf.extend_from_slice(&entries[j].1);
-                    written_in_region += size;
-                    j += 1;
-                }
-
-                if runs.is_empty() {
- // Nothing fit — mark region full and retry.
-                    state.tracker.region_filled(region);
-                    state.writable_regions.remove(0);
-                    continue;
-                }
-
- // Advance the region write pointer for all accumulated entries.
-                state.region_sizes[region as usize] += written_in_region;
-                let batch_file_offset =
-                    region as u64 * REGION_SIZE + region_start as u64;
-                i = j;
-
-                (batch_file_offset, buf, runs)
             }; // write lock released
 
- // Single pwrite for the entire batch — no lock held.
-            if !batch_buf.is_empty() {
-                #[cfg(unix)]
-                use std::os::unix::fs::FileExt;
-                self.file.write_all_at(&batch_buf, batch_file_offset)?;
-                batch_buf.clear();
-            }
+            // TODO: replace buf copy + pwrite with pwritev(iovec) for zero-copy
+            // writes. libc is already a dependency; just need unsafe + IOV_MAX
+            // chunking (cap at 900, matching MAX_COALESCE_RANGES).
+            #[cfg(unix)]
+            use std::os::unix::fs::FileExt;
+            self.file.write_all_at(&buf, file_offset)?;
 
+            // Register packed entries in the index.
             {
                 let mut state = self.state.write().unwrap();
-                let n = batch_runs.len() as u64;
-                let b: u64 = batch_runs.iter().map(|(idx, _)| entries[*idx].1.len() as u64).sum();
-                for (idx, run) in batch_runs {
-                    state.entries.insert(entries[idx].0.clone(), run);
+                let bytes: u64 = runs.iter().map(|(idx, _)| entries[*idx].1.len() as u64).sum();
+                for (idx, run) in &runs {
+                    state.entries.insert(entries[*idx].0.clone(), *run);
                 }
-                state.bytes_written += b;
-                state.entries_written += n;
+                state.bytes_written += bytes;
+                state.entries_written += runs.len() as u64;
             }
+
+            i = next_i;
         }
         Ok(())
     }
@@ -816,18 +745,6 @@ impl SsdCache {
         result
     }
 
- /// Write a single byte range to the SSD cache.
-    pub async fn insert(&self, key: DataCacheKey, data: Bytes) {
-        let file = self.select_file(key.file_id).clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(e) = file.insert(key, &data) {
-                tracing::warn!("SSD cache write failed: {}", e);
-            }
-        })
-        .await
-        .ok();
-    }
-
  /// Write multiple byte ranges with sorted, batched `write_at` calls.
  ///
  /// Entries are sorted by `(file_id, offset)` within each shard before
@@ -838,7 +755,7 @@ impl SsdCache {
             return;
         }
 
- // Group by shard file.
+        // Group by shard file.
         let mut by_file: Vec<Vec<(DataCacheKey, Bytes)>> =
             vec![Vec::new(); self.files.len()];
         for (key, data) in entries {
@@ -902,7 +819,7 @@ mod tests {
         let k = key(0, 0, 5);
         let data = Bytes::from_static(b"hello");
 
-        cache.insert(k.clone(), data.clone()).await;
+        cache.insert_many(vec![(k.clone(), data.clone())]).await;
         let result = cache.get(&k).await;
         assert_eq!(result.as_deref(), Some(b"hello".as_ref()));
     }
@@ -922,7 +839,7 @@ mod tests {
 
         for i in 0..num_entries {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
-            cache.insert(key(0, i * entry_size, entry_size), data).await;
+            cache.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
         }
 
         let stats = cache.stats();
@@ -945,21 +862,20 @@ mod tests {
 
  // Fill region 0 with 2 entries.
         cache
-            .insert(key(0, 0, entry_size as u64), Bytes::from(vec![1u8; entry_size]))
+            .insert_many(vec![(key(0, 0, entry_size as u64), Bytes::from(vec![1u8; entry_size]))])
             .await;
         cache
-            .insert(
+            .insert_many(vec![(
                 key(0, entry_size as u64, entry_size as u64),
                 Bytes::from(vec![2u8; entry_size]),
-            )
+            )])
             .await;
 
- // One more entry forces region eviction.
         cache
-            .insert(
+            .insert_many(vec![(
                 key(0, entry_size as u64 * 2, entry_size as u64),
                 Bytes::from(vec![3u8; entry_size]),
-            )
+            )])
             .await;
 
         let stats = cache.stats();
@@ -973,7 +889,7 @@ mod tests {
  // Write entries with different file_ids — they'll land on different shards.
         for file_id in 0u64..8 {
             let data = Bytes::from(vec![file_id as u8; 4096]);
-            cache.insert(key(file_id, 0, 4096), data).await;
+            cache.insert_many(vec![(key(file_id, 0, 4096), data)]).await;
         }
 
  // All should be readable.
@@ -1133,7 +1049,7 @@ mod tests {
  // Write n entries.
         for i in 0..n {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
-            cache.insert(key(0, i * entry_size, entry_size), data).await;
+            cache.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
         }
 
         let after_write = cache.stats();
@@ -1164,7 +1080,7 @@ mod tests {
 
         let before = cache.stats();
 
-        cache.insert(k.clone(), data).await;
+        cache.insert_many(vec![(k.clone(), data)]).await;
         let _ = cache.get(&k).await;
 
         let after = cache.stats();
@@ -1206,7 +1122,7 @@ mod tests {
         for i in 0..n {
  // Pattern: repeating (i % 256) so we can verify each byte.
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
-            cache.insert(key(0, i * entry_size, entry_size), data).await;
+            cache.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
         }
 
  // Read back and verify every byte.
@@ -1268,7 +1184,7 @@ mod tests {
         let small_size = 2048u64;
         for i in 0u64..8 {
             let data = Bytes::from(vec![(i * 17 % 256) as u8; small_size as usize]);
-            cache.insert(key(1, i * small_size, small_size), data).await;
+            cache.insert_many(vec![(key(1, i * small_size, small_size), data)]).await;
         }
         for i in 0u64..8 {
             let result = cache.get(&key(1, i * small_size, small_size)).await.unwrap();
@@ -1279,7 +1195,7 @@ mod tests {
         let large_size = 128 * 1024u64;
         for i in 0u64..4 {
             let data = Bytes::from(vec![(i * 31 % 256) as u8; large_size as usize]);
-            cache.insert(key(2, i * large_size, large_size), data).await;
+            cache.insert_many(vec![(key(2, i * large_size, large_size), data)]).await;
         }
         for i in 0u64..4 {
             let result = cache.get(&key(2, i * large_size, large_size)).await.unwrap();
@@ -1296,7 +1212,7 @@ mod tests {
         let big = Bytes::from(vec![0u8; REGION_SIZE as usize + 1]);
         let k = key(0, 0, REGION_SIZE + 1);
 
-        cache.insert(k.clone(), big).await;
+        cache.insert_many(vec![(k.clone(), big)]).await;
 
  // No write should have occurred.
         assert_eq!(cache.stats().entries_written, 0);
@@ -1319,7 +1235,7 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 for i in 0..n {
                     let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
-                    cache_w.insert(key(0, i * entry_size, entry_size), data).await;
+                    cache_w.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
                 }
             }
         });

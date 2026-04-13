@@ -156,6 +156,11 @@ impl Session {
         self
     }
 
+    /// Return the data cache if one is configured.
+    pub fn data_cache(&self) -> Option<&dyn DataCache> {
+        self.data_cache.as_deref()
+    }
+
     /// Register a new index extension.
     ///
     /// A name can only be registered once per type of index extension.

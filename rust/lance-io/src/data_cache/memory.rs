@@ -720,6 +720,18 @@ impl DataCache for StandaloneMemoryCache {
         let key = DataCacheKey { file_id, offset, length };
         Box::pin(self.inner.get_or_load(key, loader))
     }
+
+    fn cache_stats(&self) -> super::CacheStats {
+        let s = self.inner.stats();
+        super::CacheStats {
+            memory_hits: s.hits,
+            memory_misses: s.misses,
+            memory_evictions: s.evictions,
+            memory_current_bytes: s.current_bytes,
+            ssd_hits: 0,
+            ssd_bytes_written: 0,
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

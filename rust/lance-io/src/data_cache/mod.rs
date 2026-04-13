@@ -197,6 +197,18 @@ impl DataCacheConfig {
 
 // ─── Trait ───────────────────────────────────────────────────────────────────
 
+/// Snapshot statistics for the two-tier cache — reported per scan via
+/// `ExecutionSummaryCounts` and logged every 5 seconds by the background task.
+#[derive(Debug, Default, Clone)]
+pub struct CacheStats {
+    pub memory_hits: u64,
+    pub memory_misses: u64,
+    pub memory_evictions: u64,
+    pub memory_current_bytes: u64,
+    pub ssd_hits: u64,
+    pub ssd_bytes_written: u64,
+}
+
 /// Async two-tier (memory + SSD) data cache.
 ///
 /// The primary entry point is [`DataCache::get_or_load`], which handles both
@@ -218,6 +230,9 @@ pub trait DataCache: Send + Sync + std::fmt::Debug {
         length: u64,
         loader: BoxFuture<'a, Result<Bytes>>,
     ) -> BoxFuture<'a, Result<Bytes>>;
+
+    /// Return a snapshot of cache statistics.
+    fn cache_stats(&self) -> CacheStats;
 }
 
 // ─── NoopDataCache ───────────────────────────────────────────────────────────
@@ -236,6 +251,10 @@ impl DataCache for NoopDataCache {
         loader: BoxFuture<'a, Result<Bytes>>,
     ) -> BoxFuture<'a, Result<Bytes>> {
         loader
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        CacheStats::default()
     }
 }
 
@@ -385,6 +404,42 @@ impl TieredDataCache {
         self.memory.stats()
     }
 
+    /// Spawn a background task that logs cache stats every `interval_secs` seconds.
+    ///
+    /// Logs via both `eprintln!` (visible in tests) and `tracing::info!` (production).
+    /// The task runs until the returned `JoinHandle` is dropped or aborted.
+    pub fn start_stats_logger(self: &Arc<Self>, interval_secs: u64) -> tokio::task::JoinHandle<()> {
+        let cache = Arc::clone(self);
+        let interval = std::time::Duration::from_secs(interval_secs);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let s = cache.cache_stats();
+                let hit_rate = if s.memory_hits + s.memory_misses > 0 {
+                    s.memory_hits as f64 / (s.memory_hits + s.memory_misses) as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[CACHE STATS] memory: hits={} misses={} evictions={} bytes={} hit_rate={:.1}% | ssd: hits={} written={}B",
+                    s.memory_hits, s.memory_misses, s.memory_evictions,
+                    s.memory_current_bytes, hit_rate,
+                    s.ssd_hits, s.ssd_bytes_written,
+                );
+                tracing::info!(
+                    memory_hits = s.memory_hits,
+                    memory_misses = s.memory_misses,
+                    memory_evictions = s.memory_evictions,
+                    memory_current_bytes = s.memory_current_bytes,
+                    memory_hit_rate_pct = hit_rate,
+                    ssd_hits = s.ssd_hits,
+                    ssd_bytes_written = s.ssd_bytes_written,
+                    "cache stats"
+                );
+            }
+        })
+    }
+
     /// Wait for any in-flight SSD write to complete — Velox's
     /// `waitForWriteToFinish()`. Use in tests after triggering evictions
     /// to ensure entries have reached the SSD tier before asserting.
@@ -424,6 +479,19 @@ impl DataCache for TieredDataCache {
         };
 
         Box::pin(self.memory.get_or_load(key, effective_loader))
+    }
+
+    fn cache_stats(&self) -> CacheStats {
+        let mem = self.memory.stats();
+        let ssd = self.ssd.as_ref().map(|s| s.stats()).unwrap_or_default();
+        CacheStats {
+            memory_hits: mem.hits,
+            memory_misses: mem.misses,
+            memory_evictions: mem.evictions,
+            memory_current_bytes: mem.current_bytes,
+            ssd_hits: ssd.entries_read,
+            ssd_bytes_written: ssd.bytes_written,
+        }
     }
 }
 

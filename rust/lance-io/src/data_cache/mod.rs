@@ -269,6 +269,15 @@ impl SsdWriter {
             write_in_progress: Arc::new(AtomicBool::new(false)),
         })
     }
+
+    /// Wait until any in-flight SSD write task completes — Velox's
+    /// `waitForWriteToFinish()`. Spins on the CAS gate with tokio yields
+    /// so the async runtime can drive the write task to completion.
+    pub async fn wait_for_write(&self) {
+        while self.write_in_progress.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    }
 }
 
 impl memory::EvictionSink for SsdWriter {
@@ -309,8 +318,10 @@ impl memory::EvictionSink for SsdWriter {
 #[derive(Debug)]
 pub struct TieredDataCache {
     memory: Arc<MemoryCache>,
-    ssd: Option<Arc<SsdCache>>,
- /// Maps file paths to stable `u64` IDs used in [`DataCacheKey`].
+    pub ssd: Option<Arc<SsdCache>>,
+    /// SSD write coordinator — kept to expose `flush_ssd()` for testing.
+    ssd_writer: Option<Arc<SsdWriter>>,
+    /// Maps file paths to stable `u64` IDs used in [`DataCacheKey`].
     file_ids: Arc<FileIds>,
 }
 
@@ -349,13 +360,11 @@ impl TieredDataCache {
         };
 
         // Wire the SsdWriter as the eviction sink when SSD is available.
-        // The writer accumulates evicted entries and triggers a batch write
-        // when the threshold is hit — no long-lived background task needed.
+        let ssd_writer: Option<Arc<SsdWriter>> =
+            ssd.as_ref().map(|ssd_arc| SsdWriter::new(ssd_arc.clone()));
+
         let eviction_sink: Option<Arc<dyn memory::EvictionSink>> =
-            ssd.as_ref().map(|ssd_arc| {
-                SsdWriter::new(ssd_arc.clone())
-                    as Arc<dyn memory::EvictionSink>
-            });
+            ssd_writer.clone().map(|w| w as Arc<dyn memory::EvictionSink>);
 
         let memory = memory::MemoryCache::with_eviction_sink(
             config.max_memory_bytes,
@@ -366,6 +375,7 @@ impl TieredDataCache {
         Ok(Arc::new(Self {
             memory,
             ssd,
+            ssd_writer,
             file_ids: Arc::new(FileIds::new()),
         }))
     }
@@ -373,6 +383,15 @@ impl TieredDataCache {
  /// Return a snapshot of the memory tier statistics.
     pub fn memory_stats(&self) -> memory::MemoryCacheStats {
         self.memory.stats()
+    }
+
+    /// Wait for any in-flight SSD write to complete — Velox's
+    /// `waitForWriteToFinish()`. Use in tests after triggering evictions
+    /// to ensure entries have reached the SSD tier before asserting.
+    pub async fn flush_ssd(&self) {
+        if let Some(writer) = &self.ssd_writer {
+            writer.wait_for_write().await;
+        }
     }
 }
 
@@ -648,15 +667,11 @@ mod tests {
         assert_eq!(cache.memory_stats().hits, 5);
     }
 
-    /// Verify that memory eviction triggers immediate SSD writes (Velox model:
-    /// no accumulation threshold, write fires on each eviction batch).
+    /// Verify that memory eviction triggers SSD writes and evicted entries
+    /// are served from SSD on subsequent memory misses.
     ///
-    /// With the CAS-drop design some batches may be dropped when a write is
-    /// already in flight, so not every evicted entry is guaranteed to reach SSD.
-    /// The primary assertions are:
-    ///   1. At least some entries land on SSD (write path works).
-    ///   2. All reads return correct bytes regardless of which tier serves them.
-    ///   3. No sleep — writes happen immediately on eviction, not on a threshold.
+    /// Uses flush_ssd() (Velox's waitForWriteToFinish()) to deterministically
+    /// wait for the in-flight write task before asserting SSD state.
     #[tokio::test]
     async fn test_ssd_writer_fires_on_eviction() {
         let tmp = tempfile::tempdir().unwrap();
@@ -674,8 +689,8 @@ mod tests {
         let entry_size = 1024 * 1024u64; // 1 MiB
         let n_load = 6u64;
 
-        // Load 6 entries into a 2-entry cache — entries 0 and 1 are evicted
-        // on each subsequent insert. With 1 shard the eviction is deterministic.
+        // Load 6 entries into a 2-entry cache — entries 0..3 are evicted
+        // as later entries push them out. With 1 shard eviction is deterministic.
         for i in 0..n_load {
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
             cache
@@ -689,13 +704,11 @@ mod tests {
                 .unwrap();
         }
 
-        // Give the spawned write task time to finish — no arbitrary 800ms sleep,
-        // just yield to the tokio runtime so in-flight tasks can complete.
-        tokio::task::yield_now().await;
+        // Wait for the in-flight SSD write task to complete — deterministic,
+        // no arbitrary sleep (Velox's waitForWriteToFinish()).
+        cache.flush_ssd().await;
 
-        // Re-read evicted entries. With the CAS-drop model some may have been
-        // dropped while a write was in progress — allow re-fetches, assert
-        // data integrity and that SSD was used for at least one entry.
+        // At least some evicted entries must be on SSD now.
         let ssd_hits_before = cache.ssd.as_ref().unwrap().stats().entries_read;
         let refetch_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -708,7 +721,7 @@ mod tests {
                     i * entry_size,
                     entry_size,
                     Box::pin(async move {
-                        // SSD miss → re-fetch from object store (Velox CAS-drop behaviour).
+                        // CAS-drop: some batches dropped if gate was busy.
                         rc.fetch_add(1, Ordering::Relaxed);
                         Ok(Bytes::from(vec![(i % 256) as u8; entry_size as usize]))
                     }),
@@ -721,7 +734,7 @@ mod tests {
         let ssd_hits_after = cache.ssd.as_ref().unwrap().stats().entries_read;
         assert!(
             ssd_hits_after > ssd_hits_before,
-            "expected at least one SSD hit — write path may be broken"
+            "expected at least one SSD hit after flush_ssd()"
         );
     }
 }

@@ -118,6 +118,12 @@ pub struct DataCacheConfig {
     /// Number of SSD shard files. Must be a positive power of two.
     /// Advanced — defaults to [`ssd::DEFAULT_NUM_SSD_SHARDS`] (4).
     pub ssd_num_shards: usize,
+
+    /// When `true`, every cache hit is verified by re-fetching the same byte
+    /// range from the object store and comparing byte-for-byte.
+    /// SSD reads are also verified via CRC32 before comparison.
+    /// Expensive — use only for testing or corruption investigation.
+    pub verify: bool,
 }
 
 impl DataCacheConfig {
@@ -138,6 +144,8 @@ impl DataCacheConfig {
     pub const KEY_MEMORY_SHARDS: &'static str = "data_cache_memory_shards";
     /// SSD shard-file count (power of two). Defaults to 4.
     pub const KEY_SSD_SHARDS: &'static str = "data_cache_ssd_shards";
+    /// Verify cache hits against the object store. Expensive — testing only.
+    pub const KEY_VERIFY: &'static str = "data_cache_checksum_enabled";
 
     /// Parse from the merged `storage_options` map.
     ///
@@ -184,6 +192,11 @@ impl DataCacheConfig {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(ssd::DEFAULT_NUM_SSD_SHARDS);
 
+        let verify = opts
+            .get(Self::KEY_VERIFY)
+            .map(|v| str_is_truthy(v.trim()))
+            .unwrap_or(false);
+
         Some(Self {
             max_memory_bytes,
             num_shards,
@@ -191,6 +204,7 @@ impl DataCacheConfig {
             ssd_cache_dir,
             ssd_max_bytes,
             ssd_num_shards,
+            verify,
         })
     }
 }
@@ -566,6 +580,7 @@ mod tests {
             ssd_cache_dir: None,
             ssd_max_bytes: 0,
             ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
+            verify: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test/file.lance");
@@ -617,6 +632,7 @@ mod tests {
             ssd_cache_dir: Some(tmp.path().join("two_tier")),
             ssd_max_bytes: ssd::REGION_SIZE * 4,
             ssd_num_shards: 1,
+            verify: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");
@@ -692,6 +708,7 @@ mod tests {
             ssd_cache_dir: Some(tmp.path().join("stats_test")),
             ssd_max_bytes: ssd::REGION_SIZE * 2,
             ssd_num_shards: 1,
+            verify: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test.lance");
@@ -745,6 +762,7 @@ mod tests {
             ssd_cache_dir: Some(tmp.path().join("eviction_test")),
             ssd_max_bytes: ssd::REGION_SIZE * 4,
             ssd_num_shards: 1,
+            verify: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");

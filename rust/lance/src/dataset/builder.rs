@@ -624,6 +624,7 @@ impl DatasetBuilder {
                         Error::invalid_input(format!("failed to initialise data cache: {e}"))
                     })?;
                     s.with_data_cache(data_cache)
+                     .with_data_cache_verify(cfg.verify)
                 } else {
                     s
                 };

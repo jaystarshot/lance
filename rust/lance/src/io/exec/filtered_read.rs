@@ -420,7 +420,9 @@ impl FilteredReadStream {
         // Wire the session's data cache into the scheduler so FileScheduler
         // serves cached byte ranges without hitting the object store.
         let scheduler_config = if let Some(cache) = dataset.session.data_cache.as_ref() {
-            scheduler_config.with_data_cache(cache.clone())
+            let mut cfg = scheduler_config.with_data_cache(cache.clone());
+            cfg.verify_cache = dataset.session.data_cache_verify;
+            cfg
         } else {
             scheduler_config
         };

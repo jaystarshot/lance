@@ -487,6 +487,7 @@ pub struct ScanScheduler {
  /// Optional two-tier data cache (memory + SSD).
  /// `None` means caching is disabled.
     pub(crate) data_cache: Option<Arc<dyn DataCache>>,
+    pub(crate) verify_cache: bool,
 }
 
 impl Debug for ScanScheduler {
@@ -522,6 +523,10 @@ pub struct SchedulerConfig {
  /// object store round-trips. Use [`SchedulerConfig::with_data_cache`]
  /// to attach a cache.
     pub data_cache: Option<Arc<dyn DataCache>>,
+    /// When `true`, every cache hit is verified by re-fetching from the object
+    /// store and comparing byte-for-byte. SSD reads are also CRC32-verified.
+    /// Expensive — use only for testing or corruption investigation.
+    pub verify_cache: bool,
 }
 
 impl SchedulerConfig {
@@ -532,6 +537,7 @@ impl SchedulerConfig {
                 .ok()
                 .map(|v| str_is_truthy(v.trim())),
             data_cache: None,
+            verify_cache: false,
         }
     }
 
@@ -541,6 +547,7 @@ impl SchedulerConfig {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         }
     }
 
@@ -599,6 +606,7 @@ impl ScanScheduler {
             io_queue,
             stats: Arc::new(StatsCollector::new()),
             data_cache: config.data_cache,
+            verify_cache: config.verify_cache,
         })
     }
 
@@ -891,6 +899,74 @@ async fn submit_request_with_cache(
     futures::future::try_join_all(futs).await
 }
 
+/// Verify mode: fetch from object store AND check cache, compare byte-for-byte.
+///
+/// Always hits the object store (so performance is the same as no cache) but
+/// validates that cached bytes match the source of truth. Logs an error on
+/// mismatch. Used with `data_cache_checksum_enabled = true`.
+async fn submit_request_with_cache_verify(
+    cache: Arc<dyn DataCache>,
+    path: object_store::path::Path,
+    ranges: Vec<Range<u64>>,
+    reader: Arc<dyn Reader>,
+    root: Arc<ScanScheduler>,
+    priority: u128,
+) -> Result<Vec<Bytes>> {
+    // Always fetch from object store — this is the ground truth.
+    let source_bytes = root
+        .submit_request(reader, ranges.clone(), priority)
+        .await?;
+
+    // Compare against cache for each range.
+    for (range, source) in ranges.iter().zip(&source_bytes) {
+        let offset = range.start;
+        let length = range.end - range.start;
+        let path_clone = path.clone();
+        let source_clone = source.clone();
+
+        // Use a loader that always errors so get_or_load never populates cache
+        // from this verify call — we just want the cache lookup result.
+        let noop_loader: futures::future::BoxFuture<'static, Result<Bytes>> =
+            Box::pin(async move {
+                Err(lance_core::Error::io(format!(
+                    "verify: cache miss at offset={offset} length={length}"
+                )))
+            });
+
+        match cache.get_or_load(&path_clone, offset, length, noop_loader).await {
+            Ok(cached) => {
+                if cached != source_clone {
+                    tracing::error!(
+                        path = %path,
+                        offset = offset,
+                        length = length,
+                        cached_len = cached.len(),
+                        source_len = source_clone.len(),
+                        "CACHE CHECKSUM MISMATCH — cached bytes differ from object store"
+                    );
+                    eprintln!(
+                        "[CACHE CHECKSUM MISMATCH] path={path} offset={offset} length={length} \
+                         cached_len={} source_len={}",
+                        cached.len(), source_clone.len()
+                    );
+                } else {
+                    tracing::debug!(
+                        offset = offset,
+                        length = length,
+                        "cache checksum OK"
+                    );
+                }
+            }
+            Err(_) => {
+                // Cache miss — nothing to verify.
+                tracing::trace!(offset = offset, length = length, "cache miss during verify");
+            }
+        }
+    }
+
+    Ok(source_bytes)
+}
+
 impl FileScheduler {
  /// Submit a batch of I/O requests to the reader
  ///
@@ -954,6 +1030,7 @@ impl FileScheduler {
  // preserves the existing behaviour where tasks enter the IoQueue before
  // any `.await`, allowing multiple files to queue reads concurrently.
         let data_cache = self.root.data_cache.clone();
+        let verify_cache = self.root.verify_cache;
         let bytes_vec_fut = if data_cache.is_none() {
             Some(
                 self.root
@@ -972,10 +1049,17 @@ impl FileScheduler {
 
         async move {
             let bytes_vec: Vec<Bytes> = if let Some(cache) = data_cache {
-                submit_request_with_cache(
-                    cache, path, updated_requests.clone(), reader, root, priority,
-                )
-                .await?
+                if verify_cache {
+                    submit_request_with_cache_verify(
+                        cache, path, updated_requests.clone(), reader.clone(), root.clone(), priority,
+                    )
+                    .await?
+                } else {
+                    submit_request_with_cache(
+                        cache, path, updated_requests.clone(), reader, root, priority,
+                    )
+                    .await?
+                }
             } else {
  // No cache: await the pre-queued IoQueue batch.
  // The future was created synchronously above so all IoTasks
@@ -1251,6 +1335,7 @@ mod tests {
             io_buffer_size_bytes: 1024 * 1024,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1343,6 +1428,7 @@ mod tests {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
@@ -1419,6 +1505,7 @@ mod tests {
             io_buffer_size_bytes: 10,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         };
 
         let scan_scheduler = ScanScheduler::new(obj_store, config);
@@ -1515,6 +1602,7 @@ mod tests {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         };
         let scheduler = ScanScheduler::new(memory_store.clone(), config);
         assert!(!scheduler.uses_lite_scheduler());
@@ -1536,6 +1624,7 @@ mod tests {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         };
         let scheduler = ScanScheduler::new(uring_store.clone(), config);
         assert!(scheduler.uses_lite_scheduler());
@@ -1545,6 +1634,7 @@ mod tests {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(false),
             data_cache: None,
+            verify_cache: false,
         };
         let scheduler = ScanScheduler::new(uring_store, config);
         assert!(!scheduler.uses_lite_scheduler());
@@ -1554,6 +1644,7 @@ mod tests {
             io_buffer_size_bytes: 256 * 1024 * 1024,
             use_lite_scheduler: Some(true),
             data_cache: None,
+            verify_cache: false,
         };
         let scheduler = ScanScheduler::new(memory_store, config);
         assert!(scheduler.uses_lite_scheduler());
@@ -1576,6 +1667,7 @@ mod tests {
             io_buffer_size_bytes: 1,
             use_lite_scheduler: None,
             data_cache: None,
+            verify_cache: false,
         };
         let scan_scheduler = ScanScheduler::new(obj_store.clone(), config);
         let file_scheduler = scan_scheduler

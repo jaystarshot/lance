@@ -74,6 +74,7 @@ async fn test_cache_hit_rate_on_repeated_scans() {
         ssd_cache_dir: None,
         ssd_max_bytes: 0,
         ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
+        verify: false,
     };
     let cache = TieredDataCache::new(&config).await.unwrap();
     let dataset = open_with_cache(uri, cache.clone()).await;
@@ -157,6 +158,7 @@ async fn test_cache_data_integrity_across_scans() {
         ssd_cache_dir: None,
         ssd_max_bytes: 0,
         ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
+        verify: false,
     };
     let cache = TieredDataCache::new(&config).await.unwrap();
     let dataset = open_with_cache(uri, cache.clone()).await;

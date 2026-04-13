@@ -61,6 +61,8 @@ pub struct Session {
     /// so that repeated reads avoid network round-trips.  Shared across all
     /// scanners that open this dataset.
     pub(crate) data_cache: Option<Arc<dyn DataCache>>,
+    /// When true, every cache hit is verified against the object store.
+    pub(crate) data_cache_verify: bool,
 }
 
 impl DeepSizeOf for Session {
@@ -116,6 +118,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             data_cache: None,
+            data_cache_verify: false,
         }
     }
 
@@ -134,6 +137,7 @@ impl Session {
             index_extensions: HashMap::new(),
             store_registry,
             data_cache: None,
+            data_cache_verify: false,
         }
     }
 
@@ -153,6 +157,13 @@ impl Session {
     /// ```
     pub fn with_data_cache(mut self, cache: Arc<dyn DataCache>) -> Self {
         self.data_cache = Some(cache);
+        self
+    }
+
+    /// Enable checksum verification: every cache hit is re-fetched from the
+    /// object store and compared byte-for-byte. Expensive — testing only.
+    pub fn with_data_cache_verify(mut self, verify: bool) -> Self {
+        self.data_cache_verify = verify;
         self
     }
 

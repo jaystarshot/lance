@@ -899,11 +899,14 @@ async fn submit_request_with_cache(
     futures::future::try_join_all(futs).await
 }
 
-/// Verify mode: fetch from object store AND check cache, compare byte-for-byte.
+/// Verify mode: serve from cache normally (populating on miss), then re-fetch
+/// from the object store and compare byte-for-byte on every cache hit.
 ///
-/// Always hits the object store (so performance is the same as no cache) but
-/// validates that cached bytes match the source of truth. Logs an error on
-/// mismatch. Used with `data_cache_checksum_enabled = true`.
+/// Cold scan: cache miss → fetches from OCI, stores in cache (same as normal).
+/// Warm scan: cache hit → serves from cache AND re-fetches from OCI to verify.
+///
+/// Logs tracing::error! + eprintln! on any mismatch.
+/// Used with `data_cache_checksum_enabled = true`.
 async fn submit_request_with_cache_verify(
     cache: Arc<dyn DataCache>,
     path: object_store::path::Path,
@@ -912,59 +915,47 @@ async fn submit_request_with_cache_verify(
     root: Arc<ScanScheduler>,
     priority: u128,
 ) -> Result<Vec<Bytes>> {
-    // Always fetch from object store — this is the ground truth.
+    // Step 1: Normal cache path — populates cache on miss, hits on warm scan.
+    let cache_bytes = submit_request_with_cache(
+        cache,
+        path.clone(),
+        ranges.clone(),
+        reader.clone(),
+        root.clone(),
+        priority,
+    )
+    .await?;
+
+    // Step 2: Re-fetch from object store (ground truth).
     let source_bytes = root
         .submit_request(reader, ranges.clone(), priority)
         .await?;
 
-    // Compare against cache for each range.
-    for (range, source) in ranges.iter().zip(&source_bytes) {
-        let offset = range.start;
-        let length = range.end - range.start;
-        let path_clone = path.clone();
-        let source_clone = source.clone();
-
-        // Use a loader that always errors so get_or_load never populates cache
-        // from this verify call — we just want the cache lookup result.
-        let noop_loader: futures::future::BoxFuture<'static, Result<Bytes>> =
-            Box::pin(async move {
-                Err(lance_core::Error::io(format!(
-                    "verify: cache miss at offset={offset} length={length}"
-                )))
-            });
-
-        match cache.get_or_load(&path_clone, offset, length, noop_loader).await {
-            Ok(cached) => {
-                if cached != source_clone {
-                    tracing::error!(
-                        path = %path,
-                        offset = offset,
-                        length = length,
-                        cached_len = cached.len(),
-                        source_len = source_clone.len(),
-                        "CACHE CHECKSUM MISMATCH — cached bytes differ from object store"
-                    );
-                    eprintln!(
-                        "[CACHE CHECKSUM MISMATCH] path={path} offset={offset} length={length} \
-                         cached_len={} source_len={}",
-                        cached.len(), source_clone.len()
-                    );
-                } else {
-                    tracing::debug!(
-                        offset = offset,
-                        length = length,
-                        "cache checksum OK"
-                    );
-                }
-            }
-            Err(_) => {
-                // Cache miss — nothing to verify.
-                tracing::trace!(offset = offset, length = length, "cache miss during verify");
-            }
+    // Step 3: Compare each range.
+    for (i, (cached, source)) in cache_bytes.iter().zip(&source_bytes).enumerate() {
+        let offset = ranges[i].start;
+        let length = ranges[i].end - ranges[i].start;
+        if cached != source {
+            tracing::error!(
+                path = %path,
+                offset = offset,
+                length = length,
+                cached_len = cached.len(),
+                source_len = source.len(),
+                "CACHE CHECKSUM MISMATCH — cached bytes differ from object store"
+            );
+            eprintln!(
+                "[CACHE CHECKSUM MISMATCH] path={path} offset={offset} length={length} \
+                 cached_len={} source_len={}",
+                cached.len(), source.len()
+            );
+        } else {
+            tracing::debug!(offset = offset, length = length, "cache checksum OK");
         }
     }
 
-    Ok(source_bytes)
+    // Return cache bytes — source bytes were only fetched for verification.
+    Ok(cache_bytes)
 }
 
 impl FileScheduler {

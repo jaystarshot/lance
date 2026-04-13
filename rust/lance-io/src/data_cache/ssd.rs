@@ -299,10 +299,6 @@ impl SsdFileState {
 
             while j < entries.len() {
                 let size = entries[j].1.len() as u32;
-                if size == 0 || size as u64 > REGION_SIZE {
-                    j += 1; // skip invalid
-                    continue;
-                }
                 if written + size > available {
                     break; // region full — remaining entries go to next region
                 }
@@ -435,6 +431,12 @@ impl SsdFile {
             return Ok(());
         }
         entries.sort_by_key(|(k, _)| (k.file_id, k.offset));
+        // Drop entries that can never fit in a region — same guard as the old
+        // single-entry insert path.
+        entries.retain(|(_, b)| !b.is_empty() && b.len() as u64 <= REGION_SIZE);
+        if entries.is_empty() {
+            return Ok(());
+        }
 
         let mut i = 0;
         while i < entries.len() {

@@ -906,7 +906,7 @@ async fn submit_request_with_cache(
 /// Warm scan: cache hit → serves from cache AND re-fetches from OCI to verify.
 ///
 /// Logs tracing::error! + eprintln! on any mismatch.
-/// Used with `data_cache_checksum_enabled = true`.
+/// Used with `data_cache_check_rtt_enabled = true`.
 async fn submit_request_with_cache_verify(
     cache: Arc<dyn DataCache>,
     path: object_store::path::Path,

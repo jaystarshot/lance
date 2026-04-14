@@ -149,7 +149,7 @@ impl DataCacheConfig {
     /// SSD shard-file count (power of two). Defaults to 4.
     pub const KEY_SSD_SHARDS: &'static str = "data_cache_ssd_shards";
     /// Verify cache hits against the object store. Expensive — testing only.
-    pub const KEY_VERIFY: &'static str = "data_cache_checksum_enabled";
+    pub const KEY_VERIFY: &'static str = "data_cache_check_rtt_enabled";
     /// CRC32 verify on every SSD read. Low overhead production guard.
     pub const KEY_SSD_CRC32: &'static str = "data_cache_ssd_crc32_enabled";
 
@@ -488,7 +488,7 @@ impl DataCache for TieredDataCache {
         let effective_loader: BoxFuture<'a, Result<Bytes>> = if let Some(ssd) = &self.ssd {
             let key_for_ssd = key.clone();
             Box::pin(async move {
-                if let Some(bytes) = ssd.get(&key_for_ssd).await {
+                if let Some(bytes) = ssd.get(&key_for_ssd).await? {
                     return Ok(bytes); // L2 hit — no object store call
                 }
  // L2 miss — fetch from object store.
@@ -836,7 +836,7 @@ mod tests {
     }
 
     /// Verify that SSD bit-rot is invisible without checksum but detectable
-    /// when `data_cache_checksum_enabled` is active.
+    /// when `data_cache_check_rtt_enabled` is active.
     ///
     /// This test demonstrates the attack surface:
     ///   - Without checksum: corrupted bytes are silently returned to the caller.
@@ -902,7 +902,7 @@ mod tests {
 
         // Read entry 0 — SSD returns bytes, but they may be corrupted.
         // Without checksum there is no detection — caller gets whatever is on disk.
-        // This is the attack surface that data_cache_checksum_enabled defends against.
+        // This is the attack surface that data_cache_check_rtt_enabled defends against.
         let result = cache.get_or_load(
             &path, 0, entry_size,
             Box::pin(async move {
@@ -914,7 +914,7 @@ mod tests {
         // What we CAN assert: the SSD layer did serve a response (no panic/error).
         assert_eq!(result.len(), entry_size as usize, "SSD should return correct length");
         // Document: without checksum, corruption goes undetected.
-        // With data_cache_checksum_enabled=true the scheduler verify path catches this.
+        // With data_cache_check_rtt_enabled=true the scheduler verify path catches this.
     }
 
     /// Verify that SSD corruption is detected when checksum mode is on.

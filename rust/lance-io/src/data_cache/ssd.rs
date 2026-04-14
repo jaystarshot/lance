@@ -175,6 +175,7 @@ struct SsdFileState {
     bytes_read: u64,
     entries_written: u64,
     entries_read: u64,
+    stale_misses: u64,
 }
 
 impl SsdFileState {
@@ -189,6 +190,7 @@ impl SsdFileState {
             bytes_read: 0,
             entries_written: 0,
             entries_read: 0,
+            stale_misses: 0,
         }
     }
 
@@ -320,6 +322,7 @@ struct SsdFileStats {
     bytes_read: u64,
     entries_written: u64,
     entries_read: u64,
+    stale_misses: u64,
 }
 
 /// One SSD cache file managing N × 64 MiB regions.
@@ -376,10 +379,15 @@ impl SsdFile {
 
  /// Look up `key` and read its bytes from disk.
  ///
- /// Phase 1 (read lock): index lookup.
+ /// If the cached entry is smaller than `length`, it is a stale entry from a
+ /// prior smaller write. Return `Ok(None)` (treat as miss) — region-level
+ /// eviction will clean it up eventually. Do NOT remove the index entry (same
+ /// behaviour as Velox's SsdFile::read()).
+ ///
+ /// Phase 1 (read lock): index lookup + stale check.
  /// Phase 2 (no lock): `pread` from disk.
  /// Phase 3 (write lock): update tracker.
-    fn get(&self, key: &DataCacheKey) -> lance_core::Result<Option<Bytes>> {
+    fn get(&self, key: &DataCacheKey, length: u64) -> lance_core::Result<Option<Bytes>> {
         // Phase 1: index lookup — read lock (brief).
         let run = {
             let state = self.state.read().unwrap();
@@ -388,6 +396,14 @@ impl SsdFile {
                 None => return Ok(None),
             }
         };
+
+        // Stale check: if the stored entry is smaller than the requested length,
+        // return a miss. The caller will reload; region eviction will reclaim space.
+        if (run.size as u64) < length {
+            let mut state = self.state.write().unwrap();
+            state.stale_misses += 1;
+            return Ok(None);
+        }
 
         // Phase 2: read from disk — no lock (pread is OS-atomic).
         let offset = run.file_offset();
@@ -494,6 +510,7 @@ impl SsdFile {
             bytes_read: s.bytes_read,
             entries_written: s.entries_written,
             entries_read: s.entries_read,
+            stale_misses: s.stale_misses,
         }
     }
 }
@@ -535,6 +552,7 @@ pub struct SsdCacheStats {
     pub bytes_read: u64,
     pub entries_written: u64,
     pub entries_read: u64,
+    pub stale_misses: u64,
 }
 
 // ─── SsdCache ────────────────────────────────────────────────────────────────
@@ -602,11 +620,14 @@ impl SsdCache {
     }
 
     /// Look up a single byte range in the SSD cache.
+    ///
+    /// `length` is the number of bytes being requested. If the cached entry is
+    /// smaller (stale), returns `Ok(None)` — region eviction reclaims space later.
     /// Returns `Err` on CRC32 mismatch (corruption detected).
-    pub async fn get(&self, key: &DataCacheKey) -> lance_core::Result<Option<Bytes>> {
+    pub async fn get(&self, key: &DataCacheKey, length: u64) -> lance_core::Result<Option<Bytes>> {
         let file = self.select_file(key.file_id).clone();
         let key = key.clone();
-        tokio::task::spawn_blocking(move || file.get(&key))
+        tokio::task::spawn_blocking(move || file.get(&key, length))
             .await
             .map_err(|e| lance_core::Error::io(e.to_string()))?
     }
@@ -652,6 +673,7 @@ impl SsdCache {
             bytes_read: file_stats.iter().map(|s| s.bytes_read).sum(),
             entries_written: file_stats.iter().map(|s| s.entries_written).sum(),
             entries_read: file_stats.iter().map(|s| s.entries_read).sum(),
+            stale_misses: file_stats.iter().map(|s| s.stale_misses).sum(),
         }
     }
 }
@@ -663,13 +685,8 @@ mod tests {
     use super::*;
     use crc32fast;
 
-    fn key(file_id: u64, offset: u64, length: u64) -> DataCacheKey {
-        DataCacheKey { file_id, offset, length }
-    }
-
-    /// Test helper: unwrap the Result from get(), panic on CRC error.
-    async fn get_ok(cache: &Arc<SsdCache>, k: &DataCacheKey) -> Option<Bytes> {
-        cache.get(k).await.expect("SsdCache::get returned Err (CRC mismatch?)")
+    fn key(file_id: u64, offset: u64) -> DataCacheKey {
+        DataCacheKey { file_id, offset }
     }
 
     async fn make_cache(max_bytes: u64, num_shards: usize) -> Arc<SsdCache> {
@@ -689,18 +706,18 @@ mod tests {
     #[tokio::test]
     async fn test_basic_insert_and_get() {
         let cache = make_cache(REGION_SIZE * 4, 1).await;
-        let k = key(0, 0, 5);
+        let k = key(0, 0);
         let data = Bytes::from_static(b"hello");
 
         cache.insert_many(vec![(k.clone(), data.clone())]).await;
-        let result = cache.get(&k).await.unwrap();
+        let result = cache.get(&k, 5).await.unwrap();
         assert_eq!(result.as_deref(), Some(b"hello".as_ref()));
     }
 
     #[tokio::test]
     async fn test_miss_returns_none() {
         let cache = make_cache(REGION_SIZE * 2, 1).await;
-        assert!(cache.get(&key(99, 0, 4)).await.unwrap().is_none());
+        assert!(cache.get(&key(99, 0), 4).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -712,7 +729,7 @@ mod tests {
 
         for i in 0..num_entries {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
-            cache.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
+            cache.insert_many(vec![(key(0, i * entry_size), data)]).await;
         }
 
         let stats = cache.stats();
@@ -721,7 +738,7 @@ mod tests {
 
  // All entries should still be readable.
         for i in 0..num_entries {
-            let result = cache.get(&key(0, i * entry_size, entry_size)).await.unwrap();
+            let result = cache.get(&key(0, i * entry_size), entry_size).await.unwrap();
             assert!(result.is_some(), "entry {i} missing after region growth");
             assert_eq!(result.unwrap()[0], i as u8);
         }
@@ -735,18 +752,18 @@ mod tests {
 
  // Fill region 0 with 2 entries.
         cache
-            .insert_many(vec![(key(0, 0, entry_size as u64), Bytes::from(vec![1u8; entry_size]))])
+            .insert_many(vec![(key(0, 0), Bytes::from(vec![1u8; entry_size]))])
             .await;
         cache
             .insert_many(vec![(
-                key(0, entry_size as u64, entry_size as u64),
+                key(0, entry_size as u64),
                 Bytes::from(vec![2u8; entry_size]),
             )])
             .await;
 
         cache
             .insert_many(vec![(
-                key(0, entry_size as u64 * 2, entry_size as u64),
+                key(0, entry_size as u64 * 2),
                 Bytes::from(vec![3u8; entry_size]),
             )])
             .await;
@@ -762,12 +779,12 @@ mod tests {
  // Write entries with different file_ids — they'll land on different shards.
         for file_id in 0u64..8 {
             let data = Bytes::from(vec![file_id as u8; 4096]);
-            cache.insert_many(vec![(key(file_id, 0, 4096), data)]).await;
+            cache.insert_many(vec![(key(file_id, 0), data)]).await;
         }
 
  // All should be readable.
         for file_id in 0u64..8 {
-            let result = cache.get(&key(file_id, 0, 4096)).await.unwrap();
+            let result = cache.get(&key(file_id, 0), 4096).await.unwrap();
             assert!(result.is_some(), "file_id={file_id} missing");
             assert_eq!(result.unwrap()[0], file_id as u8);
         }
@@ -781,7 +798,7 @@ mod tests {
 
         let entries: Vec<(DataCacheKey, Bytes)> = (0u64..10)
             .map(|i| {
-                let k = key(0, i * 4096, 4096);
+                let k = key(0, i * 4096);
                 let v = Bytes::from(vec![i as u8; 4096]);
                 (k, v)
             })
@@ -790,7 +807,7 @@ mod tests {
         cache.insert_many(entries).await;
 
         for i in 0u64..10 {
-            let result = cache.get(&key(0, i * 4096, 4096)).await.unwrap();
+            let result = cache.get(&key(0, i * 4096), 4096).await.unwrap();
             assert!(result.is_some(), "entry {i} missing");
             assert_eq!(result.unwrap()[0], i as u8);
         }
@@ -806,12 +823,12 @@ mod tests {
         let entry_size = 4096u64;
 
         let entries: Vec<(DataCacheKey, Bytes)> = (0u64..5)
-            .map(|i| (key(0, i * entry_size, entry_size), Bytes::from(vec![i as u8; entry_size as usize])))
+            .map(|i| (key(0, i * entry_size), Bytes::from(vec![i as u8; entry_size as usize])))
             .collect();
         cache.insert_many(entries).await;
 
         for i in 0u64..5 {
-            let r = cache.get(&key(0, i * entry_size, entry_size)).await.unwrap();
+            let r = cache.get(&key(0, i * entry_size), entry_size).await.unwrap();
             assert!(r.is_some(), "entry {i} missing");
             assert_eq!(r.unwrap()[0], i as u8);
         }
@@ -913,7 +930,7 @@ mod tests {
  // Write n entries.
         for i in 0..n {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
-            cache.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
+            cache.insert_many(vec![(key(0, i * entry_size), data)]).await;
         }
 
         let after_write = cache.stats();
@@ -924,7 +941,7 @@ mod tests {
 
  // Read all n entries back.
         for i in 0..n {
-            let result = cache.get(&key(0, i * entry_size, entry_size)).await.unwrap();
+            let result = cache.get(&key(0, i * entry_size), entry_size).await.unwrap();
             assert!(result.is_some(), "entry {i} missing");
         }
 
@@ -940,12 +957,12 @@ mod tests {
     async fn test_ssd_stats_delta() {
         let cache = make_cache(REGION_SIZE * 4, 1).await;
         let data = Bytes::from(vec![42u8; 4096]);
-        let k = key(0, 0, 4096);
+        let k = key(0, 0);
 
         let before = cache.stats();
 
         cache.insert_many(vec![(k.clone(), data)]).await;
-        let _ = cache.get(&k).await;
+        let _ = cache.get(&k, 4096).await;
 
         let after = cache.stats();
 
@@ -987,12 +1004,12 @@ mod tests {
         for i in 0..n {
  // Pattern: repeating (i % 256) so we can verify each byte.
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
-            cache.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
+            cache.insert_many(vec![(key(0, i * entry_size), data)]).await;
         }
 
  // Read back and verify every byte.
         for i in 0..n {
-            let result = cache.get(&key(0, i * entry_size, entry_size)).await.unwrap();
+            let result = cache.get(&key(0, i * entry_size), entry_size).await.unwrap();
             let bytes = result.unwrap_or_else(|| panic!("entry {i} not found"));
             assert_eq!(
                 bytes.len(),
@@ -1025,13 +1042,13 @@ mod tests {
 
         // Write 5 entries.
         let entries: Vec<(DataCacheKey, Bytes)> = (0u64..5)
-            .map(|i| (key(0, i * entry_size, entry_size), Bytes::from(vec![(i * 37 % 256) as u8; entry_size as usize])))
+            .map(|i| (key(0, i * entry_size), Bytes::from(vec![(i * 37 % 256) as u8; entry_size as usize])))
             .collect();
         cache.insert_many(entries).await;
 
         // All reads must pass CRC32 and return correct data.
         for i in 0u64..5 {
-            let result = cache.get(&key(0, i * entry_size, entry_size)).await.unwrap();
+            let result = cache.get(&key(0, i * entry_size), entry_size).await.unwrap();
             assert!(result.is_some(), "entry {i} should be readable");
             assert_eq!(result.unwrap()[0], (i * 37 % 256) as u8, "entry {i}: wrong data");
         }
@@ -1056,11 +1073,11 @@ mod tests {
             crc32_enabled: true,
         };
         let cache = SsdCache::new(config).await.unwrap();
-        let k = key(0, 0, entry_size);
+        let k = key(0, 0);
         cache.insert_many(vec![(k.clone(), Bytes::from(vec![pattern; entry_size as usize]))]).await;
 
         // Reads correctly before corruption.
-        let before = cache.get(&k).await.unwrap();
+        let before = cache.get(&k, entry_size).await.unwrap();
         assert!(before.is_some(), "should hit before corruption");
         assert!(before.unwrap().iter().all(|&b| b == pattern));
 
@@ -1089,12 +1106,12 @@ mod tests {
             crc32_enabled: true,
         };
         let cache2 = SsdCache::new(config2).await.unwrap();
-        let k2 = key(0, 0, entry_size);
+        let k2 = key(0, 0);
         let good_data = Bytes::from(vec![pattern; entry_size as usize]);
         cache2.insert_many(vec![(k2.clone(), good_data.clone())]).await;
 
         // Before corruption: hit with correct data.
-        assert_eq!(cache2.get(&k2).await.unwrap().unwrap(), good_data);
+        assert_eq!(cache2.get(&k2, entry_size).await.unwrap().unwrap(), good_data);
 
         // Verify CRC32 logic inline: hash of correct data must match stored checksum.
         let correct_crc = crc32fast::hash(&good_data);
@@ -1110,9 +1127,9 @@ mod tests {
         let cache = make_cache(REGION_SIZE * 2, 1).await; // crc32_enabled=false
         let entry_size = 4096u64;
         let data = Bytes::from(vec![0x42u8; entry_size as usize]);
-        let k = key(0, 0, entry_size);
+        let k = key(0, 0);
         cache.insert_many(vec![(k.clone(), data.clone())]).await;
-        assert_eq!(cache.get(&k).await.unwrap().unwrap(), data);
+        assert_eq!(cache.get(&k, entry_size).await.unwrap().unwrap(), data);
     }
 
  /// appendSsdSaveable (appendAll=true path): insert_many
@@ -1127,7 +1144,7 @@ mod tests {
         let entries: Vec<(DataCacheKey, Bytes)> = (0..n)
             .map(|i| {
                 let pattern = vec![(i % 256) as u8; entry_size as usize];
-                (key(0, i * entry_size, entry_size), Bytes::from(pattern))
+                (key(0, i * entry_size), Bytes::from(pattern))
             })
             .collect();
 
@@ -1138,7 +1155,7 @@ mod tests {
 
  // All entries must be readable with correct data.
         for i in 0..n {
-            let result = cache.get(&key(0, i * entry_size, entry_size)).await.unwrap();
+            let result = cache.get(&key(0, i * entry_size), entry_size).await.unwrap();
             let bytes = result.unwrap_or_else(|| panic!("entry {i} missing after insert_many"));
             assert_eq!(bytes[0], (i % 256) as u8, "entry {i}: wrong data");
         }
@@ -1154,10 +1171,10 @@ mod tests {
         let small_size = 2048u64;
         for i in 0u64..8 {
             let data = Bytes::from(vec![(i * 17 % 256) as u8; small_size as usize]);
-            cache.insert_many(vec![(key(1, i * small_size, small_size), data)]).await;
+            cache.insert_many(vec![(key(1, i * small_size), data)]).await;
         }
         for i in 0u64..8 {
-            let result = cache.get(&key(1, i * small_size, small_size)).await.unwrap().unwrap();
+            let result = cache.get(&key(1, i * small_size), small_size).await.unwrap().unwrap();
             assert_eq!(result[0], (i * 17 % 256) as u8, "small entry {i}");
         }
 
@@ -1165,10 +1182,10 @@ mod tests {
         let large_size = 128 * 1024u64;
         for i in 0u64..4 {
             let data = Bytes::from(vec![(i * 31 % 256) as u8; large_size as usize]);
-            cache.insert_many(vec![(key(2, i * large_size, large_size), data)]).await;
+            cache.insert_many(vec![(key(2, i * large_size), data)]).await;
         }
         for i in 0u64..4 {
-            let result = cache.get(&key(2, i * large_size, large_size)).await.unwrap().unwrap();
+            let result = cache.get(&key(2, i * large_size), large_size).await.unwrap().unwrap();
             assert_eq!(result[0], (i * 31 % 256) as u8, "large entry {i}");
             assert_eq!(result.len(), large_size as usize);
         }
@@ -1180,13 +1197,13 @@ mod tests {
     async fn test_oversized_entry_silently_skipped() {
         let cache = make_cache(REGION_SIZE * 2, 1).await;
         let big = Bytes::from(vec![0u8; REGION_SIZE as usize + 1]);
-        let k = key(0, 0, REGION_SIZE + 1);
+        let k = key(0, 0);
 
         cache.insert_many(vec![(k.clone(), big)]).await;
 
  // No write should have occurred.
         assert_eq!(cache.stats().entries_written, 0);
-        assert!(cache.get(&k).await.unwrap().is_none());
+        assert!(cache.get(&k, REGION_SIZE + 1).await.unwrap().is_none());
     }
 
  /// Concurrent inserts and gets on the same cache must not corrupt data —
@@ -1205,7 +1222,7 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 for i in 0..n {
                     let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
-                    cache_w.insert_many(vec![(key(0, i * entry_size, entry_size), data)]).await;
+                    cache_w.insert_many(vec![(key(0, i * entry_size), data)]).await;
                 }
             }
         });
@@ -1215,7 +1232,7 @@ mod tests {
         let reader = tokio::spawn(async move {
             while std::time::Instant::now() < deadline {
                 for i in 0..n {
-                    if let Some(bytes) = cache_r.get(&key(0, i * entry_size, entry_size)).await.unwrap() {
+                    if let Some(bytes) = cache_r.get(&key(0, i * entry_size), entry_size).await.unwrap() {
  // Verify data integrity: all bytes should match the pattern.
                         assert_eq!(
                             bytes.len(),

@@ -81,10 +81,14 @@ impl Session {
     ///     Entries evicted from memory (may have been written to SSD).
     /// memory_current_bytes : int
     ///     Bytes currently held in the memory tier.
+    /// memory_stale_evictions : int
+    ///     Memory entries evicted because cached size < requested length.
     /// ssd_hits : int
     ///     Memory misses that were served from the SSD (L2) tier.
     /// ssd_bytes_written : int
     ///     Total bytes written to the SSD tier via memory eviction.
+    /// ssd_stale_misses : int
+    ///     SSD entries skipped because cached size < requested length.
     pub fn cache_stats<'py>(&self, py: Python<'py>) -> pyo3::PyResult<Option<pyo3::Bound<'py, PyDict>>> {
         let Some(cache) = self.inner.data_cache() else {
             return Ok(None);
@@ -95,8 +99,10 @@ impl Session {
         d.set_item("memory_misses", s.memory_misses)?;
         d.set_item("memory_evictions", s.memory_evictions)?;
         d.set_item("memory_current_bytes", s.memory_current_bytes)?;
+        d.set_item("memory_stale_evictions", s.memory_stale_evictions)?;
         d.set_item("ssd_hits", s.ssd_hits)?;
         d.set_item("ssd_bytes_written", s.ssd_bytes_written)?;
+        d.set_item("ssd_stale_misses", s.ssd_stale_misses)?;
         Ok(Some(d))
     }
 }

@@ -170,6 +170,8 @@ struct CacheShardInner {
     hits: u64,
     misses: u64,
     evictions: u64,
+    /// Stale entries evicted because cached size < requested size (Velox stale-entry logic).
+    stale_evictions: u64,
 }
 
 impl CacheShardInner {
@@ -184,6 +186,7 @@ impl CacheShardInner {
             hits: 0,
             misses: 0,
             evictions: 0,
+            stale_evictions: 0,
         }
     }
 
@@ -310,6 +313,7 @@ pub struct ShardStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    pub stale_evictions: u64,
 }
 
 struct CacheShard {
@@ -329,6 +333,12 @@ impl CacheShard {
 
     /// Look up or atomically create an entry for `key`.
     ///
+    /// `min_size`: if a cached entry's `data_size` is greater than 0 but less
+    /// than `min_size`, the entry is stale (a previous smaller request cached
+    /// fewer bytes than we now need). The stale entry is evicted and a fresh
+    /// miss is returned so the caller can reload the full range — mirrors
+    /// Velox's `lookupLocked` stale-entry eviction.
+    ///
     /// Evicts BEFORE inserting when `loaded_bytes >= per_shard_limit` —
     /// same as Velox: allocation failure → makeSpace() → evict → retry.
     /// Eviction and insertion are atomic within the same lock hold.
@@ -337,13 +347,28 @@ impl CacheShard {
     fn find_or_create(
         &self,
         key: &DataCacheKey,
+        min_size: u64,
     ) -> (Arc<CacheEntry>, bool, u64, Vec<(DataCacheKey, Bytes)>) {
         let mut inner = self.inner.lock().unwrap();
 
-        if inner.entries.contains_key(key) {
-            inner.hits += 1;
-            let entry = inner.entries.get(key).unwrap().clone();
-            return (entry, false, 0, Vec::new());
+        if let Some(entry) = inner.entries.get(key).cloned() {
+            // Stale check: entry is loaded but smaller than requested.
+            let cached_size = entry.data_size.load(Ordering::Relaxed);
+            if cached_size > 0 && cached_size < min_size {
+                // Evict stale entry — caller will reload the full range.
+                if let Some(e) = inner.entries.remove(key) {
+                    let sz = e.data_size.swap(0, Ordering::Relaxed);
+                    if sz > 0 {
+                        inner.loaded_bytes = inner.loaded_bytes.saturating_sub(sz);
+                    }
+                    inner.stale_evictions += 1;
+                    inner.evictions += 1;
+                }
+                // Fall through to create a new entry (treated as miss below).
+            } else {
+                inner.hits += 1;
+                return (entry, false, 0, Vec::new());
+            }
         }
 
         // Evict before inserting if this shard is at or over its limit.
@@ -398,6 +423,7 @@ impl CacheShard {
             hits: inner.hits,
             misses: inner.misses,
             evictions: inner.evictions,
+            stale_evictions: inner.stale_evictions,
         }
     }
 }
@@ -428,6 +454,7 @@ pub struct MemoryCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub evictions: u64,
+    pub stale_evictions: u64,
     pub current_bytes: u64,
     pub max_bytes: u64,
 }
@@ -504,17 +531,18 @@ impl MemoryCache {
     pub fn stats(&self) -> MemoryCacheStats {
         // Sweep all shards — each briefly acquires its own lock.
         // Locks are held for microseconds; stats reads are infrequent.
-        let (hits, misses, evictions) = self.shards.iter().fold(
-            (0u64, 0u64, 0u64),
-            |(h, m, e), shard| {
-                let s = shard.stats();
-                (h + s.hits, m + s.misses, e + s.evictions)
+        let (hits, misses, evictions, stale_evictions) = self.shards.iter().fold(
+            (0u64, 0u64, 0u64, 0u64),
+            |(h, m, e, s), shard| {
+                let st = shard.stats();
+                (h + st.hits, m + st.misses, e + st.evictions, s + st.stale_evictions)
             },
         );
         MemoryCacheStats {
             hits,
             misses,
             evictions,
+            stale_evictions,
             current_bytes: self.total_bytes.load(Ordering::Relaxed),
             max_bytes: self.max_bytes,
         }
@@ -529,20 +557,25 @@ impl MemoryCache {
 
     /// Fetch bytes for `key`, calling `loader` on a cache miss.
     ///
+    /// `length` is the number of bytes requested. If the cache holds a larger
+    /// entry for the same `(file_id, offset)` the returned slice is trimmed to
+    /// `length`. If the cached entry is *smaller* than `length` it is treated as
+    /// stale — evicted and reloaded via `loader`.
+    ///
     /// - **Exclusive path** (`is_new = true`): this task owns the entry and
     ///   calls `load_exclusive` to fetch and populate the cache.
     /// - **Waiter path** (`is_new = false`): another task is already loading;
     ///   `wait_for_entry` subscribes to the watch channel and returns when done.
     ///   If the concurrent load failed, returns an error — the caller should retry.
-    pub async fn get_or_load(&self, key: DataCacheKey, loader: BoxFuture<'_, Result<Bytes>>) -> Result<Bytes> {
+    pub async fn get_or_load(&self, key: DataCacheKey, length: u64, loader: BoxFuture<'_, Result<Bytes>>) -> Result<Bytes> {
         if self.max_bytes == 0 {
             return loader.await;
         }
 
-        let (entry, is_new) = self.find_or_create(&key);
+        let (entry, is_new) = self.find_or_create(&key, length);
 
         if is_new {
-            return self.load_exclusive(&key, &entry, loader).await;
+            return self.load_exclusive(&key, length, &entry, loader).await;
         }
 
         // Entry exists — wait for the current owner to finish.
@@ -550,11 +583,12 @@ impl MemoryCache {
         //   Loaded  → bytes returned immediately, no suspend (fast path)
         //   Loading → suspend on watch channel until owner sends Loaded/Failed
         //   Failed  → owner's load failed; surface the error to the caller
-        self.wait_for_entry(&key, &entry).await.ok_or_else(|| {
+        let bytes = self.wait_for_entry(&key, length, &entry).await.ok_or_else(|| {
             lance_core::Error::io(
                 "concurrent cache load failed; retry the operation".to_string(),
             )
-        })
+        })?;
+        Ok(bytes)
     }
 
     /// Exclusive load path: called when this task created the cache entry.
@@ -565,6 +599,7 @@ impl MemoryCache {
     async fn load_exclusive(
         &self,
         key: &DataCacheKey,
+        length: u64,
         entry: &Arc<CacheEntry>,
         loader: BoxFuture<'_, Result<Bytes>>,
     ) -> Result<Bytes> {
@@ -575,7 +610,6 @@ impl MemoryCache {
                 tracing::trace!(
                     file_id = key.file_id,
                     offset = key.offset,
-                    length = key.length,
                     size_bytes = size,
                     "memory cache miss — entry loaded and stored"
                 );
@@ -590,7 +624,10 @@ impl MemoryCache {
                 let shard = &self.shards[shard_idx(key, self.shard_mask)];
                 shard.record_loaded(size);
                 self.total_bytes.fetch_add(size, Ordering::Relaxed);
-                Ok(bytes)
+                // Return exactly `length` bytes — the loader may have returned
+                // a larger buffer (e.g. aligned read). Cached bytes are kept in
+                // full so that a future request for a larger range is a hit.
+                Ok(bytes.slice(0..length.min(size) as usize))
             }
             Err(e) => {
                 // Signal waiters and remove the entry so the next caller
@@ -610,6 +647,7 @@ impl MemoryCache {
     async fn wait_for_entry(
         &self,
         key: &DataCacheKey,
+        length: u64,
         entry: &Arc<CacheEntry>,
     ) -> Option<Bytes> {
         let mut rx = entry.state_tx.subscribe();
@@ -623,12 +661,11 @@ impl MemoryCache {
                     tracing::trace!(
                         file_id = key.file_id,
                         offset = key.offset,
-                        length = key.length,
                         size_bytes = bytes.len(),
                         "memory cache hit"
                     );
                     // hits are counted in find_or_create (inside the shard lock)
-                    return Some(bytes);
+                    return Some(bytes.slice(0..length.min(bytes.len() as u64) as usize));
                 }
                 LoadState::Failed => {
                     // Loading task failed — caller will retry as new owner.
@@ -647,9 +684,9 @@ impl MemoryCache {
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
-    fn find_or_create(&self, key: &DataCacheKey) -> (Arc<CacheEntry>, bool) {
+    fn find_or_create(&self, key: &DataCacheKey, min_size: u64) -> (Arc<CacheEntry>, bool) {
         let (entry, is_new, freed, evicted) =
-            self.shards[shard_idx(key, self.shard_mask)].find_or_create(key);
+            self.shards[shard_idx(key, self.shard_mask)].find_or_create(key, min_size);
         if freed > 0 {
             self.total_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
@@ -716,8 +753,8 @@ impl DataCache for StandaloneMemoryCache {
         loader: BoxFuture<'a, Result<Bytes>>,
     ) -> BoxFuture<'a, Result<Bytes>> {
         let file_id = self.file_ids.get_or_intern(path);
-        let key = DataCacheKey { file_id, offset, length };
-        Box::pin(self.inner.get_or_load(key, loader))
+        let key = DataCacheKey { file_id, offset };
+        Box::pin(self.inner.get_or_load(key, length, loader))
     }
 
     fn cache_stats(&self) -> super::CacheStats {
@@ -727,8 +764,10 @@ impl DataCache for StandaloneMemoryCache {
             memory_misses: s.misses,
             memory_evictions: s.evictions,
             memory_current_bytes: s.current_bytes,
+            memory_stale_evictions: s.stale_evictions,
             ssd_hits: 0,
             ssd_bytes_written: 0,
+            ssd_stale_misses: 0,
         }
     }
 }
@@ -741,8 +780,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
 
-    fn key(file_id: u64, offset: u64, length: u64) -> DataCacheKey {
-        DataCacheKey { file_id, offset, length }
+    fn key(file_id: u64, offset: u64) -> DataCacheKey {
+        DataCacheKey { file_id, offset }
     }
 
  // ── Shard configuration tests (mirrors numShardsDefault / numShardsInvalid) ─
@@ -779,15 +818,15 @@ mod tests {
     async fn test_single_shard_cache_works() {
  // Degenerate case: 1 shard — all entries in one map, still correct.
         let cache = MemoryCache::new_with_shards(10 * 1024 * 1024, 1);
-        let k = key(0, 0, 4);
+        let k = key(0, 0);
         let bytes = cache
-            .get_or_load(k.clone(), Box::pin(async { Ok(Bytes::from_static(b"hi")) }))
+            .get_or_load(k.clone(), 2, Box::pin(async { Ok(Bytes::from_static(b"hi")) }))
             .await
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"hi"));
  // Second call — hit.
         let bytes2 = cache
-            .get_or_load(k, Box::pin(async { Ok(Bytes::from_static(b"miss")) }))
+            .get_or_load(k, 2, Box::pin(async { Ok(Bytes::from_static(b"miss")) }))
             .await
             .unwrap();
         assert_eq!(bytes2, Bytes::from_static(b"hi"));
@@ -797,11 +836,11 @@ mod tests {
     #[tokio::test]
     async fn test_basic_hit_and_miss() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
-        let k = key(0, 0, 4);
+        let k = key(0, 0);
 
  // First access — miss, loader runs.
         let bytes = cache
-            .get_or_load(k.clone(), Box::pin(async { Ok(Bytes::from_static(b"hello")) }))
+            .get_or_load(k.clone(), 5, Box::pin(async { Ok(Bytes::from_static(b"hello")) }))
             .await
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"hello"));
@@ -812,6 +851,7 @@ mod tests {
         let bytes2 = cache
             .get_or_load(
                 k.clone(),
+                5,
                 Box::pin(async move {
                     lc.fetch_add(1, Ordering::Relaxed);
                     Ok(Bytes::from_static(b"should not be called"))
@@ -830,7 +870,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_deduplication() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
-        let k = key(1, 0, 4);
+        let k = key(1, 0);
         let load_count = Arc::new(AtomicUsize::new(0));
 
  // Launch 8 concurrent requests for the same key.
@@ -843,6 +883,7 @@ mod tests {
                 cache
                     .get_or_load(
                         k,
+                        4,
                         Box::pin(async move {
                             lc.fetch_add(1, Ordering::Relaxed);
  // Small delay so other tasks arrive before load completes.
@@ -864,12 +905,13 @@ mod tests {
     #[tokio::test]
     async fn test_loader_failure_allows_retry() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
-        let k = key(2, 0, 4);
+        let k = key(2, 0);
 
  // First access fails.
         let result = cache
             .get_or_load(
                 k.clone(),
+                8,
                 Box::pin(async { Err(lance_core::Error::io("boom".to_string())) }),
             )
             .await;
@@ -877,7 +919,7 @@ mod tests {
 
  // Second access should succeed — entry was removed after failure.
         let bytes = cache
-            .get_or_load(k, Box::pin(async { Ok(Bytes::from_static(b"retry ok")) }))
+            .get_or_load(k, 8, Box::pin(async { Ok(Bytes::from_static(b"retry ok")) }))
             .await
             .unwrap();
         assert_eq!(bytes, Bytes::from_static(b"retry ok"));
@@ -893,7 +935,7 @@ mod tests {
         for i in 0..8u64 {
             let data = chunk.clone();
             cache
-                .get_or_load(key(3, i, chunk.len() as u64), Box::pin(async move { Ok(data) }))
+                .get_or_load(key(3, i), chunk.len() as u64, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -913,7 +955,7 @@ mod tests {
     async fn test_disabled_cache_bypasses() {
  // max_bytes == 0 means disabled; loader is called every time.
         let cache = MemoryCache::new(0);
-        let k = key(4, 0, 4);
+        let k = key(4, 0);
         let count = Arc::new(AtomicUsize::new(0));
 
         for _ in 0..3 {
@@ -921,6 +963,7 @@ mod tests {
             cache
                 .get_or_load(
                     k.clone(),
+                    1,
                     Box::pin(async move {
                         c.fetch_add(1, Ordering::Relaxed);
                         Ok(Bytes::from_static(b"x"))
@@ -950,7 +993,8 @@ mod tests {
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
             cache
                 .get_or_load(
-                    key(0, i * entry_size, entry_size),
+                    key(0, i * entry_size),
+                    entry_size,
                     Box::pin(async move { Ok(data) }),
                 )
                 .await
@@ -962,7 +1006,8 @@ mod tests {
             let data = Bytes::from(vec![(i % 256) as u8; entry_size as usize]);
             let _ = cache
                 .get_or_load(
-                    key(0, i * entry_size, entry_size),
+                    key(0, i * entry_size),
+                    entry_size,
                     Box::pin(async move { Ok(data) }),
                 )
                 .await
@@ -983,7 +1028,8 @@ mod tests {
             let data = Bytes::from(vec![0u8; entry_size as usize]);
             cache
                 .get_or_load(
-                    key(0, i * entry_size, entry_size),
+                    key(0, i * entry_size),
+                    entry_size,
                     Box::pin(async move { Ok(data) }),
                 )
                 .await
@@ -1009,7 +1055,8 @@ mod tests {
             let data = Bytes::from(vec![0u8; entry_size as usize]);
             cache
                 .get_or_load(
-                    key(1, i * entry_size, entry_size),
+                    key(1, i * entry_size),
+                    entry_size,
                     Box::pin(async move { Ok(data) }),
                 )
                 .await
@@ -1035,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_waiters_see_failure_and_retry() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
-        let k = key(5, 0, 4);
+        let k = key(5, 0);
         let load_count = Arc::new(AtomicUsize::new(0));
 
  // The FIRST loader call (whichever task wins find_or_create) fails.
@@ -1056,6 +1103,7 @@ mod tests {
                 cache
                     .get_or_load(
                         k,
+                        2,
                         Box::pin(async move {
                             let call_idx = lc.fetch_add(1, Ordering::SeqCst);
                             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1091,7 +1139,7 @@ mod tests {
         // A fresh get_or_load after all tasks have returned starts clean —
         // the failed entry was removed, so this succeeds as a new miss.
         let bytes = cache
-            .get_or_load(k, Box::pin(async { Ok(Bytes::from_static(b"fresh")) }))
+            .get_or_load(k, 5, Box::pin(async { Ok(Bytes::from_static(b"fresh")) }))
             .await
             .unwrap();
         // No retry happened — entry was removed after failure.
@@ -1123,12 +1171,12 @@ mod tests {
                     let file_id = rng.random_range(0..num_files);
                     let offset_idx = rng.random_range(0..offsets_per_file);
                     let offset = offset_idx * entry_size;
-                    let k = key(file_id, offset, entry_size);
+                    let k = key(file_id, offset);
 
                     let data =
                         Bytes::from(vec![(file_id ^ offset_idx) as u8; entry_size as usize]);
                     let _ = cache
-                        .get_or_load(k, Box::pin(async move { Ok(data) }))
+                        .get_or_load(k, entry_size, Box::pin(async move { Ok(data) }))
                         .await
                         .unwrap();
                 }
@@ -1154,12 +1202,12 @@ mod tests {
     #[tokio::test]
     async fn test_stats_accounting() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
-        let k = key(6, 0, 4);
+        let k = key(6, 0);
         let requests = 10usize;
 
         for _ in 0..requests {
             cache
-                .get_or_load(k.clone(), Box::pin(async { Ok(Bytes::from_static(b"x")) }))
+                .get_or_load(k.clone(), 1, Box::pin(async { Ok(Bytes::from_static(b"x")) }))
                 .await
                 .unwrap();
         }
@@ -1200,7 +1248,8 @@ mod tests {
                     let data = Bytes::from(vec![0u8; entry_size as usize]);
                     cache
                         .get_or_load(
-                            key(thread_id, offset, entry_size),
+                            key(thread_id, offset),
+                            entry_size,
                             Box::pin(async move { Ok(data) }),
                         )
                         .await
@@ -1246,7 +1295,8 @@ mod tests {
         let loading = tokio::spawn(async move {
             let _ = cache_clone
                 .get_or_load(
-                    key(99, 0, entry_size),
+                    key(99, 0),
+                    entry_size,
                     Box::pin(async move {
                         rx.await.ok(); // suspended — entry is in Loading state
                         Ok(Bytes::from(vec![0u8; entry_size as usize]))
@@ -1265,7 +1315,8 @@ mod tests {
         let data = Bytes::from(vec![1u8; entry_size as usize]);
         let _ = cache
             .get_or_load(
-                key(99, entry_size, entry_size),
+                key(99, entry_size),
+                entry_size,
                 Box::pin(async move { Ok(data) }),
             )
             .await
@@ -1293,7 +1344,7 @@ mod tests {
         for i in 0..2u64 {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
             cache
-                .get_or_load(key(0, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .get_or_load(key(0, i * entry_size), entry_size, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -1306,7 +1357,7 @@ mod tests {
         for i in 2..4u64 {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
             cache
-                .get_or_load(key(0, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .get_or_load(key(0, i * entry_size), entry_size, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -1330,7 +1381,7 @@ mod tests {
         for i in 0..32u64 {
             let data = Bytes::from(vec![0u8; entry_size as usize]);
             cache
-                .get_or_load(key(0, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .get_or_load(key(0, i * entry_size), entry_size, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -1340,7 +1391,7 @@ mod tests {
  // all are eviction candidates. One more load triggers final convergence.
         let data = Bytes::from(vec![0u8; entry_size as usize]);
         cache
-            .get_or_load(key(1, 0, entry_size), Box::pin(async move { Ok(data) }))
+            .get_or_load(key(1, 0), entry_size, Box::pin(async move { Ok(data) }))
             .await
             .unwrap();
 
@@ -1388,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_miss() {
         let cache = MemoryCache::new(10 * 1024 * 1024);
-        let k = key(10, 0, 4);
+        let k = key(10, 0);
         let load_count = Arc::new(AtomicUsize::new(0));
         let lc = load_count.clone();
 
@@ -1396,6 +1447,7 @@ mod tests {
         let bytes = cache
             .get_or_load(
                 k.clone(),
+                4,
                 Box::pin(async move {
                     lc.fetch_add(1, Ordering::Relaxed);
                     Ok(Bytes::from_static(b"data"))
@@ -1411,7 +1463,7 @@ mod tests {
 
  /// findHit: after a miss populates the cache, the next
  /// access must return exactly the same bytes without calling the loader.
- /// Verifies data integrity (byte-for-byte match) — equivalent to 
+ /// Verifies data integrity (byte-for-byte match) — equivalent to
  /// `checkContents(*entry)`.
     #[tokio::test]
     async fn test_find_hit_data_integrity() {
@@ -1419,18 +1471,18 @@ mod tests {
  // Use a recognisable pattern so a stale-copy bug would be detectable.
         let pattern: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
         let original = Bytes::from(pattern.clone());
-        let k = key(11, 0, 4096);
+        let k = key(11, 0);
 
  // Miss — populate cache.
         let b1 = cache
-            .get_or_load(k.clone(), Box::pin(async move { Ok(original) }))
+            .get_or_load(k.clone(), 4096, Box::pin(async move { Ok(original) }))
             .await
             .unwrap();
         assert_eq!(b1.as_ref(), pattern.as_slice(), "loaded bytes must match pattern");
 
  // Hit — must return identical bytes without calling loader.
         let b2 = cache
-            .get_or_load(k, Box::pin(async { panic!("loader must not be called on hit") }))
+            .get_or_load(k, 4096, Box::pin(async { panic!("loader must not be called on hit") }))
             .await
             .unwrap();
         assert_eq!(b2.as_ref(), pattern.as_slice(), "hit bytes must match original");
@@ -1452,7 +1504,7 @@ mod tests {
         for i in 0u64..4 {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
             cache
-                .get_or_load(key(12, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .get_or_load(key(12, i * entry_size), entry_size, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -1461,7 +1513,7 @@ mod tests {
         for i in 0u64..4 {
             let data = Bytes::from(vec![i as u8; entry_size as usize]);
             cache
-                .get_or_load(key(12, i * entry_size, entry_size), Box::pin(async move { Ok(data) }))
+                .get_or_load(key(12, i * entry_size), entry_size, Box::pin(async move { Ok(data) }))
                 .await
                 .unwrap();
         }
@@ -1481,7 +1533,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_exclusive_to_shared_transition() {
         let cache = Arc::new(MemoryCache::new(10 * 1024 * 1024));
-        let k = key(13, 0, 8);
+        let k = key(13, 0);
 
         let (loading_tx, loading_rx) = tokio::sync::oneshot::channel::<()>();
         let (done_tx, _done_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1494,6 +1546,7 @@ mod tests {
             cache_a
                 .get_or_load(
                     k_a,
+                    9,
                     Box::pin(async move {
                         loading_tx.send(()).ok(); // signal: exclusive load started
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -1515,6 +1568,7 @@ mod tests {
             cache_b
                 .get_or_load(
                     k_b,
+                    9,
                     Box::pin(async { panic!("waiter must not call its own loader") }),
                 )
                 .await

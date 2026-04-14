@@ -62,18 +62,19 @@ use ssd::{SsdCache, SsdCacheConfig};
 
 /// Cache key for a raw byte range within a file.
 ///
-/// The `file_id` is a stable numeric identifier for the file path (interned
-/// by [`FileIds`]). The `offset` and `length` are the byte range after
-/// `FileScheduler` has coalesced and split the requested ranges — those
-/// post-processed ranges are stable across repeated reads of the same column.
+/// Mirrors Velox's `FileCacheKey { fileNum, offset }` — length is intentionally
+/// absent. A single offset may be requested with varying lengths at different
+/// times; storing length in the key would create separate entries for the same
+/// underlying bytes (fragmentation, false misses). Instead, length is passed
+/// at lookup time and checked against the stored entry size: if the cached
+/// entry is smaller than requested it is treated as stale and evicted so the
+/// caller can reload the full range.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DataCacheKey {
- /// Stable numeric ID for the file path.
+    /// Stable numeric ID for the file path.
     pub file_id: u64,
- /// Byte offset within the file (start of the cached range).
+    /// Byte offset within the file (start of the cached range).
     pub offset: u64,
- /// Length of the cached range in bytes.
-    pub length: u64,
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -231,8 +232,12 @@ pub struct CacheStats {
     pub memory_misses: u64,
     pub memory_evictions: u64,
     pub memory_current_bytes: u64,
+    /// Stale memory entries evicted because cached size < requested length.
+    pub memory_stale_evictions: u64,
     pub ssd_hits: u64,
     pub ssd_bytes_written: u64,
+    /// SSD entries skipped because cached size < requested length (stale miss).
+    pub ssd_stale_misses: u64,
 }
 
 /// Async two-tier (memory + SSD) data cache.
@@ -480,26 +485,26 @@ impl DataCache for TieredDataCache {
         loader: BoxFuture<'a, Result<Bytes>>,
     ) -> BoxFuture<'a, Result<Bytes>> {
         let file_id = self.file_ids.get_or_intern(path);
-        let key = DataCacheKey { file_id, offset, length };
+        let key = DataCacheKey { file_id, offset };
 
- // If SSD tier is enabled, check L2 (SSD) on L1 (memory) miss before
- // falling back to the object store. SSD writes now happen lazily via
- // the eviction channel — NOT here on every fetch.
+        // If SSD tier is enabled, check L2 (SSD) on L1 (memory) miss before
+        // falling back to the object store. SSD writes now happen lazily via
+        // the eviction channel — NOT here on every fetch.
         let effective_loader: BoxFuture<'a, Result<Bytes>> = if let Some(ssd) = &self.ssd {
             let key_for_ssd = key.clone();
             Box::pin(async move {
-                if let Some(bytes) = ssd.get(&key_for_ssd).await? {
+                if let Some(bytes) = ssd.get(&key_for_ssd, length).await? {
                     return Ok(bytes); // L2 hit — no object store call
                 }
- // L2 miss — fetch from object store.
- // SSD write happens when this entry is later evicted from memory.
+                // L2 miss — fetch from object store.
+                // SSD write happens when this entry is later evicted from memory.
                 loader.await
             })
         } else {
             loader
         };
 
-        Box::pin(self.memory.get_or_load(key, effective_loader))
+        Box::pin(self.memory.get_or_load(key, length, effective_loader))
     }
 
     fn cache_stats(&self) -> CacheStats {
@@ -510,8 +515,10 @@ impl DataCache for TieredDataCache {
             memory_misses: mem.misses,
             memory_evictions: mem.evictions,
             memory_current_bytes: mem.current_bytes,
+            memory_stale_evictions: mem.stale_evictions,
             ssd_hits: ssd.entries_read,
             ssd_bytes_written: ssd.bytes_written,
+            ssd_stale_misses: ssd.stale_misses,
         }
     }
 }

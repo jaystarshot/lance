@@ -4229,6 +4229,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "chrono",
+ "crc32fast",
  "deepsize",
  "futures",
  "http 1.4.0",

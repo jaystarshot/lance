@@ -124,6 +124,10 @@ pub struct DataCacheConfig {
     /// SSD reads are also verified via CRC32 before comparison.
     /// Expensive — use only for testing or corruption investigation.
     pub verify: bool,
+
+    /// When `true`, compute CRC32 on every SSD write and verify on every read.
+    /// Detects SSD bit-rot without network calls. Low overhead.
+    pub ssd_crc32_enabled: bool,
 }
 
 impl DataCacheConfig {
@@ -146,6 +150,8 @@ impl DataCacheConfig {
     pub const KEY_SSD_SHARDS: &'static str = "data_cache_ssd_shards";
     /// Verify cache hits against the object store. Expensive — testing only.
     pub const KEY_VERIFY: &'static str = "data_cache_checksum_enabled";
+    /// CRC32 verify on every SSD read. Low overhead production guard.
+    pub const KEY_SSD_CRC32: &'static str = "data_cache_ssd_crc32_enabled";
 
     /// Parse from the merged `storage_options` map.
     ///
@@ -197,6 +203,11 @@ impl DataCacheConfig {
             .map(|v| str_is_truthy(v.trim()))
             .unwrap_or(false);
 
+        let ssd_crc32_enabled = opts
+            .get(Self::KEY_SSD_CRC32)
+            .map(|v| str_is_truthy(v.trim()))
+            .unwrap_or(false);
+
         Some(Self {
             max_memory_bytes,
             num_shards,
@@ -205,6 +216,7 @@ impl DataCacheConfig {
             ssd_max_bytes,
             ssd_num_shards,
             verify,
+            ssd_crc32_enabled,
         })
     }
 }
@@ -377,6 +389,7 @@ impl TieredDataCache {
                         cache_dir: dir.clone(),
                         max_bytes: config.ssd_max_bytes,
                         num_shards: config.ssd_num_shards,
+                        crc32_enabled: config.ssd_crc32_enabled,
                     };
                     Some(SsdCache::new(ssd_config).await?)
                 }
@@ -581,6 +594,7 @@ mod tests {
             ssd_max_bytes: 0,
             ssd_num_shards: ssd::DEFAULT_NUM_SSD_SHARDS,
             verify: false,
+            ssd_crc32_enabled: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test/file.lance");
@@ -633,6 +647,7 @@ mod tests {
             ssd_max_bytes: ssd::REGION_SIZE * 4,
             ssd_num_shards: 1,
             verify: false,
+            ssd_crc32_enabled: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");
@@ -709,6 +724,7 @@ mod tests {
             ssd_max_bytes: ssd::REGION_SIZE * 2,
             ssd_num_shards: 1,
             verify: false,
+            ssd_crc32_enabled: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("test.lance");
@@ -763,6 +779,7 @@ mod tests {
             ssd_max_bytes: ssd::REGION_SIZE * 4,
             ssd_num_shards: 1,
             verify: false,
+            ssd_crc32_enabled: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");
@@ -845,6 +862,7 @@ mod tests {
                 ssd_max_bytes: ssd::REGION_SIZE * 2,
                 ssd_num_shards: 1,
                 verify: false,
+            ssd_crc32_enabled: false,
             };
             let cache = TieredDataCache::new(&config).await.unwrap();
             let path = Path::from("s3://bucket/data.lance");
@@ -877,6 +895,7 @@ mod tests {
             ssd_max_bytes: ssd::REGION_SIZE * 2,
             ssd_num_shards: 1,
             verify: false,
+            ssd_crc32_enabled: false,
         };
         let cache = TieredDataCache::new(&config).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");
@@ -926,6 +945,7 @@ mod tests {
                 ssd_max_bytes: ssd::REGION_SIZE * 2,
                 ssd_num_shards: 1,
                 verify: false,
+            ssd_crc32_enabled: false,
             };
             let cache = TieredDataCache::new(&config).await.unwrap();
             let path = Path::from("s3://bucket/data.lance");
@@ -960,6 +980,7 @@ mod tests {
             ssd_max_bytes: ssd::REGION_SIZE * 2,
             ssd_num_shards: 1,
             verify: true,
+            ssd_crc32_enabled: false,
         };
         let cache_v = TieredDataCache::new(&config_verify).await.unwrap();
         let path = Path::from("s3://bucket/data.lance");

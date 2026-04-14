@@ -23,7 +23,8 @@
 //! │ HIT → populate L1 → return
 //! │
 //! └─ L3: object store (network, tens–hundreds of ms)
-//! → populate L2 + L1 → return
+//!     → populate L1 → return
+//!         (L1 eviction async writes to L2)
 //! ```
 //!
 //! # Configuration

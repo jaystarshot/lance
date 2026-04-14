@@ -741,10 +741,14 @@ impl FileFragment {
             // Load the file metadata, confirm the schema is compatible, and
             // determine the column offsets
             let mut frag = Fragment::new(fragment_id as u64);
-            let scheduler = ScanScheduler::new(
-                dataset.object_store.clone(),
-                SchedulerConfig::max_bandwidth(&dataset.object_store),
-            );
+            let scheduler = {
+                let mut config = SchedulerConfig::max_bandwidth(&dataset.object_store);
+                if let Some(cache) = dataset.session.data_cache.as_ref() {
+                    config = config.with_data_cache(cache.clone());
+                    config.verify_cache = dataset.session.data_cache_verify;
+                }
+                ScanScheduler::new(dataset.object_store.clone(), config)
+            };
             let file_scheduler = scheduler
                 .open_file(&filepath, &CachedFileSize::unknown())
                 .await?;
@@ -975,10 +979,15 @@ impl FileFragment {
                     read_config.reader_priority.unwrap_or(0),
                 )
             } else {
+                let mut config = SchedulerConfig::max_bandwidth(&self.dataset.object_store);
+                if let Some(cache) = self.dataset.session.data_cache.as_ref() {
+                    config = config.with_data_cache(cache.clone());
+                    config.verify_cache = self.dataset.session.data_cache_verify;
+                }
                 (
                     ScanScheduler::new(
                         self.dataset.object_store.clone(),
-                        SchedulerConfig::max_bandwidth(&self.dataset.object_store),
+                        config,
                     ),
                     0,
                 )

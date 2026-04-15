@@ -624,7 +624,7 @@ impl DatasetBuilder {
                         Error::invalid_input(format!("failed to initialise data cache: {e}"))
                     })?;
                     s.with_data_cache(data_cache)
-                     .with_data_cache_verify(cfg.verify)
+                        .with_data_cache_verify(cfg.verify)
                 } else {
                     s
                 };
@@ -640,7 +640,22 @@ impl DatasetBuilder {
 
         let file_reader_options = self.file_reader_options.clone();
         let store_params = self.options.clone();
-        let (object_store, base_path, commit_handler) = self.build_object_store().await?;
+        let (mut object_store, base_path, commit_handler) = self.build_object_store().await?;
+
+        // Wire the session's data cache into the object store so that every
+        // CloudObjectReader opened from this store transparently serves cached
+        // byte ranges — no per-scanner wiring needed.
+        //
+        // Note: `Arc::get_mut` would fail here because the ObjectStoreRegistry
+        // keeps a weak reference to the store. We clone the ObjectStore value
+        // (cheap — all heavy fields are Arc-wrapped) to get an exclusive copy
+        // with the cache set.
+        if let Some(cache) = session.data_cache.as_ref() {
+            let mut store_with_cache = (*object_store).clone();
+            store_with_cache.data_cache = Some(cache.clone());
+            store_with_cache.data_cache_verify = session.data_cache_verify;
+            object_store = Arc::new(store_with_cache);
+        }
 
         // Two cases that need to check out after loading the manifest:
         // 1. If the target is configured as a branch, we need to check the branch field in the manifest

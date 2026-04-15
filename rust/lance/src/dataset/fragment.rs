@@ -742,11 +742,7 @@ impl FileFragment {
             // determine the column offsets
             let mut frag = Fragment::new(fragment_id as u64);
             let scheduler = {
-                let mut config = SchedulerConfig::max_bandwidth(&dataset.object_store);
-                if let Some(cache) = dataset.session.data_cache.as_ref() {
-                    config = config.with_data_cache(cache.clone());
-                    config.verify_cache = dataset.session.data_cache_verify;
-                }
+                let config = SchedulerConfig::max_bandwidth(&dataset.object_store);
                 ScanScheduler::new(dataset.object_store.clone(), config)
             };
             let file_scheduler = scheduler
@@ -979,16 +975,9 @@ impl FileFragment {
                     read_config.reader_priority.unwrap_or(0),
                 )
             } else {
-                let mut config = SchedulerConfig::max_bandwidth(&self.dataset.object_store);
-                if let Some(cache) = self.dataset.session.data_cache.as_ref() {
-                    config = config.with_data_cache(cache.clone());
-                    config.verify_cache = self.dataset.session.data_cache_verify;
-                }
+                let config = SchedulerConfig::max_bandwidth(&self.dataset.object_store);
                 (
-                    ScanScheduler::new(
-                        self.dataset.object_store.clone(),
-                        config,
-                    ),
+                    ScanScheduler::new(self.dataset.object_store.clone(), config),
                     0,
                 )
             };

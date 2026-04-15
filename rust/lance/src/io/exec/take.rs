@@ -616,11 +616,7 @@ impl ExecutionPlan for TakeExec {
         // TakeStream until the stream is polled.
         let lazy_take_stream = futures::stream::once(async move {
             let obj_store = dataset.object_store.clone();
-            let mut scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
-            if let Some(cache) = dataset.session.data_cache.as_ref() {
-                scheduler_config = scheduler_config.with_data_cache(cache.clone());
-                scheduler_config.verify_cache = dataset.session.data_cache_verify;
-            }
+            let scheduler_config = SchedulerConfig::max_bandwidth(&obj_store);
             // unwrap is safe since SchedulerConfig::max_bandwidth is always valid
             let scan_scheduler = ScanScheduler::new(obj_store, scheduler_config);
 
